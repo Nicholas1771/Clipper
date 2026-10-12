@@ -2,13 +2,64 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import smtplib
 from email.message import EmailMessage
+from pathlib import Path
 
 from common.env import parse_bool
 
 
 logger = logging.getLogger(__name__)
+
+
+def environment_tag() -> str:
+    env = (os.getenv("CLIPPER_ENV") or os.getenv("ENVIRONMENT") or "").strip().upper()
+    if env in {"PROD", "PRODUCTION"}:
+        return "PROD"
+    if env in {"LOCAL", "DEV", "DEVELOPMENT", "TEST"}:
+        return "LOCAL"
+    # Auto-detect: on the EC2 production instance
+    if os.name != "nt" and (Path("/home/ubuntu/Clipper").exists() or os.getenv("USER") == "ubuntu"):
+        return "PROD"
+    return "LOCAL"
+
+
+def platform_tag(platform: str) -> str:
+    norm = platform.strip().lower() if platform else ""
+    if norm in {"instagram", "ig"}:
+        return "IG"
+    if norm in {"youtube", "yt"}:
+        return "YT"
+    return "IG/YT"
+
+
+def format_alert_subject(*, subject: str, platform: str = "") -> str:
+    env = environment_tag()
+    plat = platform_tag(platform)
+    account = os.getenv("ACCOUNT_NAME", "").strip() or "Clipper"
+
+    rest = subject.strip()
+    patterns = [
+        r"^\[(PROD|LOCAL)\]\s*",
+        r"^\[(IG|YT|IG/YT)\]\s*",
+        rf"^\[{re.escape(account)}\]\s*",
+        rf"^{re.escape(account)}\s*",
+        r"^\[?Clipper\]?\s*",
+        r"^\[?Instagram\]?\s*",
+        r"^\[?YouTube\]?\s*",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", rest, flags=re.IGNORECASE).strip()
+            if cleaned != rest:
+                rest = cleaned
+                changed = True
+
+    return f"[{env}] [{plat}] [{account}] {rest}"
+
 
 def send_email_alert(*, app_name: str, subject: str, body: str, platform: str = "") -> bool:
     enabled = parse_bool(os.getenv("ALERT_EMAIL_ENABLED"), default=True, strict=False)
@@ -32,15 +83,10 @@ def send_email_alert(*, app_name: str, subject: str, body: str, platform: str = 
         logger.warning("Email alert skipped because ALERT_EMAIL_FROM (or ALERT_EMAIL_USERNAME) is not configured.")
         return False
 
-    account = os.getenv("ACCOUNT_NAME", "").strip()
-    rest = subject.strip()
-    for prefix in (platform, "Clipper", account):
-        if prefix and rest.lower().startswith(prefix.lower() + " "):
-            rest = rest[len(prefix):].strip()
-    subject = " ".join(part for part in (platform or "Clipper", account, rest) if part)
+    final_subject = format_alert_subject(subject=subject, platform=platform)
 
     message = EmailMessage()
-    message["Subject"] = subject
+    message["Subject"] = final_subject
     message["From"] = from_address
     message["To"] = to_address
     message.set_content(body)
@@ -71,7 +117,7 @@ def send_failure_alert(
     subject: str | None = None,
     platform: str = "",
 ) -> None:
-    subject = subject or (f"Clipper Fail - {clip_id}" if clip_id else f"Clipper Fail - {app_name}")
+    subject = subject or (f"Fail - {clip_id}" if clip_id else f"Fail - {app_name}")
     body = (
         f"App: {app_name}\n"
         f"Context: {context}\n"
