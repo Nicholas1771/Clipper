@@ -1,0 +1,1 @@
+Write 3 long paragraphs (3-4 sentences each, 9-12 sentences total) separated by a blank line, for ig description with this caption and transcript. No emojis or headers. Do not mention or reference ig, description, caption, or transcript, etc in the summary. Paragraphs separated by newlines. Caption: "__CAPTION__", Transcript: "__TRANSCRIPT__"

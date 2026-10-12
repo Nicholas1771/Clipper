@@ -1,0 +1,5 @@
+Inspect source frames and detect caption text overlay location. Classify caption_position as TOP, MIDDLE, BOTTOM, or NONE. Set has_caption=true only when overlaid caption text is clearly visible. Classify the position of the MAIN subtitle/caption text that appears across most frames (for example word-by-word captions in the middle of the screen). Ignore small watermark, username, channel-name or logo text, and text that appears in only one frame. Return BOTTOM only if the main captions sit in the lower third of the frame; if they sit around the vertical center return MIDDLE.
+
+Available details: __CONTEXT__
+
+Return only JSON with schema {"has_caption": boolean, "caption_position": "TOP|MIDDLE|BOTTOM|NONE", "confidence": number}.

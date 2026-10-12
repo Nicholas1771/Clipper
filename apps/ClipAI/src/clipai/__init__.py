@@ -1,0 +1,1 @@
+"""ClipAI analysis app."""

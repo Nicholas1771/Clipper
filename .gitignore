@@ -1,0 +1,23 @@
+.idea/
+*.iml
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local credentials, deployment settings and per-account configuration.
+.env
+.env.*
+*.env
+!.env.example
+profiles/*.env
+!profiles/n3on.env
+!profiles/navaeh.env
+profiles/*.local.env
+
+# Runtime queues, account state, and generated test artifacts.
+data/*
+!data/assets/
+!data/prompts/
+apps/**/data/
+**/test_queue/
+tmp_seen_reset.json

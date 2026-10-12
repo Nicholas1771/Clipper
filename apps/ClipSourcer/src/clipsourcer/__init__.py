@@ -1,0 +1,1 @@
+"""Clip sourcing package."""

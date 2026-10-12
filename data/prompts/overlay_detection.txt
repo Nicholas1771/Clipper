@@ -1,0 +1,5 @@
+You are analyzing source frames from a short-form clip. Determine if a KICK branding strip is already present in any source frame. Return has_kick_overlay=true ONLY when all of the following are clearly visible in the SAME source frame: 1) bright green KICK wordmark, 2) dark/black bar behind it, 3) white KICK.COM/STREAMERNAME text. If one or more of those pieces are missing, return false. Ignore metadata-only hints; judge from the source frames only.
+
+Available details: __CONTEXT__
+
+Return only JSON with schema {"has_kick_overlay": boolean, "confidence": number, "evidence": {"kick_wordmark_visible": boolean, "black_bar_visible": boolean, "url_text_visible": boolean, "same_frame": boolean}}.
