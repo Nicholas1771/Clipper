@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 MAX_TITLE_LENGTH = 100
-MAX_DESCRIPTION_LENGTH = 5000
 MAX_UPLOAD_ATTEMPTS = 5
 VALID_PRIVACY = {"public", "unlisted", "private"}
 
@@ -65,29 +64,35 @@ def fetch_access_token(config: AppConfig) -> str:
     return token
 
 
-def build_description(config: AppConfig, item: QueueItem) -> str:
-    """Description body followed by one space-delimited hashtag run: streamer tag first, then the AI tags, then #Shorts."""
-    text = (item.youtube_description or item.description or item.caption).replace("\r\n", "\n").replace("\r", "\n")
-    body, others = _split_trailing_hashtags(re.sub(r"\n{3,}", "\n\n", text).strip())
+def build_title(config: AppConfig, item: QueueItem) -> str:
+    """AI text plus hashtags, all in the title. Hashtags that would push it past 100 characters are dropped."""
+    source = (item.description or item.caption or f"@{item.author_handle} clip").replace("\r\n", "\n").replace("\r", "\n")
+    body, others = _split_trailing_hashtags(source.strip())
+    ai_text = item.youtube_description.strip()
+    if ai_text:
+        text = " ".join(ai_text.split())
+    else:
+        text = " ".join(re.split(r"\n\s*\n", body.strip())[0].split()) if body.strip() else ""
+    text = re.sub(r"(?<!\w)#\S+", " ", text).replace("<", "").replace(">", "")
+    text = " ".join(text.split()) or "Clip"
+    if len(text) > MAX_TITLE_LENGTH:
+        text = text[:MAX_TITLE_LENGTH].rsplit(" ", 1)[0].rstrip(" ,;:-") or text[:MAX_TITLE_LENGTH]
     streamer = getattr(config, "streamer_hashtag", "") or ""
-    tags: list[str] = []
-    for tag in ([f"#{streamer}"] if streamer else []) + others + ["#Shorts"]:
-        if tag.lower() not in {existing.lower() for existing in tags}:
-            tags.append(tag)
-    return f"{body} {' '.join(tags)}".strip()
+    seen: set[str] = set()
+    title = text
+    for tag in ([f"#{streamer}"] if streamer else []) + others:
+        if tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        if len(title) + 1 + len(tag) <= MAX_TITLE_LENGTH:
+            title = f"{title} {tag}"
+    return title
 
 
 def build_video_metadata(config: AppConfig, item: QueueItem) -> dict[str, Any]:
-    title = (item.youtube_title or item.caption or f"@{item.author_handle} clip").replace("<", "").replace(">", "").strip()
-    title = " ".join(title.split())[:MAX_TITLE_LENGTH] or "Clip"
-    description = build_description(config, item)
     privacy = config.youtube_privacy_status if config.youtube_privacy_status in VALID_PRIVACY else "public"
     return {
-        "snippet": {
-            "title": title,
-            "description": description.replace("<", "").replace(">", "")[:MAX_DESCRIPTION_LENGTH],
-            "categoryId": config.youtube_category_id,
-        },
+        "snippet": {"title": build_title(config, item), "description": "", "categoryId": config.youtube_category_id},
         "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
 

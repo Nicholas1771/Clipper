@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         choices=APPS,
         help="Run one cycle immediately through this app without archiving the queue, then shut everything down.",
     )
+    parser.add_argument(
+        "--publish",
+        choices=("instagram", "youtube"),
+        help="Publish only to this platform (default: whatever the schedule assigns to each slot).",
+    )
     parser.add_argument("--test", action="store_true", help="Run everything inside <QUEUE_DIR>/Test, using its source folder instead of sourcing a new clip.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without launching.")
     return parser.parse_args()
@@ -75,11 +80,16 @@ def terminate_children(children: list[subprocess.Popen]) -> None:
             child.kill()
 
 
-def launch_processes(plan: list[tuple[str, Path, list[str]]], stop_mode: bool, test_mode: bool = False, profile: str = "default") -> int:
+def launch_processes(plan: list[tuple[str, Path, list[str]]], stop_mode: bool, test_mode: bool = False, profile: str = "default", publish_only: str | None = None) -> int:
     children: list[subprocess.Popen] = []
     env = dict(os.environ, CLIPPER_PROFILE=profile)
     if test_mode:
         env["CLIPPER_TEST_MODE"] = "1"
+    if publish_only:
+        env["CLIPPER_PUBLISH_ONLY"] = publish_only
+        print(f"[launcher] publishing only to: {publish_only}")
+    else:
+        env.pop("CLIPPER_PUBLISH_ONLY", None)
     print(f"[launcher] profile: {profile}")
     try:
         for name, dir_path, flags in plan:
@@ -116,7 +126,7 @@ def main() -> int:
         for name, dir_path, flags in plan:
             print(f"[dry-run] [{args.profile}] {name} @ {dir_path}: main.py {' '.join(flags)}".rstrip())
         return 0
-    return launch_processes(plan, stop_mode=bool(args.stop_after), test_mode=args.test, profile=args.profile)
+    return launch_processes(plan, stop_mode=bool(args.stop_after), test_mode=args.test, profile=args.profile, publish_only=args.publish)
 
 
 if __name__ == "__main__":

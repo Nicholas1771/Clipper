@@ -15,7 +15,7 @@ from common.alerts import send_email_alert, send_failure_alert
 from clippublisher.instagram_client import publish_to_instagram
 from clippublisher.queue import claim_item, discover_queue_items, is_item_ready
 from clippublisher.youtube_client import is_configured as youtube_is_configured, publish_to_youtube
-from common.platforms import INSTAGRAM, YOUTUBE, read_slot_platforms
+from common.platforms import INSTAGRAM, PLATFORM_LABELS, YOUTUBE, read_slot_platforms
 from clippublisher.token_manager import resolve_publish_access_token
 
 
@@ -69,41 +69,32 @@ def alert_details(config: AppConfig, item: Any) -> str:
 
 
 def alert_subject(config: AppConfig, clip_id: str, outcome: str) -> str:
-    account = os.getenv("ACCOUNT_NAME", "").strip() or "Clipper"
     state = load_json(config.queue_dir / "scheduler_state.json")
     position = ""
     if isinstance(state, dict):
         slot_index = state.get("slot_index")
         total = state.get("total_slots") or len(state.get("slots") or [])
-        if isinstance(slot_index, int) and total:
+        if isinstance(slot_index, int) and slot_index >= 0 and total:
             position = f" [{slot_index + 1}/{total}]"
-    return f"{account}{position} {outcome} - {clip_id}"
+    return f"{outcome}{position} - {clip_id}"
 
 
-PLATFORM_LABELS = {INSTAGRAM: "Instagram", YOUTUBE: "YouTube"}
-
-
-def send_posted_alert(*, clip_id: str, author_handle: str, publish_result: dict[str, Any] | None = None, details: str = "", title: str = "", subject: str | None = None, results: dict[str, Any] | None = None, failures: dict[str, Exception] | None = None) -> None:
-    results = dict(results) if results else {INSTAGRAM: publish_result or {}}
-    subject = subject or f"Clipper Success - {clip_id}"
-    lines = []
-    for platform, result in results.items():
-        result = result if isinstance(result, dict) else {}
-        if platform == YOUTUBE:
-            lines.append(f"YouTube video: {result.get('url') or result.get('id') or 'unknown'}")
-        else:
-            lines.append(f"Instagram publish id: {result.get('id') or 'unknown'}")
-    for platform, error in (failures or {}).items():
-        lines.append(f"{PLATFORM_LABELS.get(platform, platform)} FAILED: {error}")
+def send_posted_alert(*, clip_id: str, author_handle: str, platform: str = INSTAGRAM, publish_result: dict[str, Any] | None = None, details: str = "", title: str = "", subject: str | None = None) -> None:
+    result = publish_result if isinstance(publish_result, dict) else {}
+    subject = subject or f"Success - {clip_id}"
+    if platform == YOUTUBE:
+        line = f"YouTube video: {result.get('url') or result.get('id') or 'unknown'}"
+    else:
+        line = f"Instagram publish id: {result.get('id') or 'unknown'}"
     body = (
         f"Clip posted successfully.\n"
         f"Clip ID: {clip_id}\n"
         f"{details or f'Author: @{author_handle}' + chr(10)}"
-        + "\n".join(lines) + "\n"
+        f"{line}\n"
     )
     if title:
         body += f"\n\nDetails\n{title}\n"
-    send_email_alert(app_name="ClipPublisher", subject=subject, body=body)
+    send_email_alert(app_name="ClipPublisher", subject=subject, body=body, platform=PLATFORM_LABELS.get(platform, platform))
 
 
 class QueuePublisherRunner:
@@ -216,14 +207,14 @@ class QueuePublisherRunner:
             except Exception as error:
                 failures[platform] = error
                 logger.exception("%s publish failed for %s: %s", PLATFORM_LABELS.get(platform, platform), claimed.run_dir.name, error)
-                outcome = "Fail" if platforms == [INSTAGRAM] else f"Fail {PLATFORM_LABELS.get(platform, platform)}"
                 send_failure_alert(
                     app_name="ClipPublisher",
                     error=error,
                     context=f"{PLATFORM_LABELS.get(platform, platform)} publish failure for {claimed.run_dir.name}",
                     clip_id=claimed.clip_id,
                     details=alert_details(self.config, claimed),
-                    subject=alert_subject(self.config, claimed.clip_id, outcome),
+                    subject=alert_subject(self.config, claimed.clip_id, "Fail"),
+                    platform=PLATFORM_LABELS.get(platform, platform),
                     title=original_title(claimed.manifest_path, claimed.caption),
                 )
                 setattr(error, "_clipper_alert_sent", True)
@@ -247,15 +238,16 @@ class QueuePublisherRunner:
             encoding="utf-8",
         )
         if results:
-            send_posted_alert(
-                clip_id=claimed.clip_id,
-                author_handle=claimed.author_handle,
-                results=results,
-                failures=failures,
-                details=alert_details(self.config, claimed),
-                subject=alert_subject(self.config, claimed.clip_id, "Partial" if failures else "Success"),
-                title=original_title(claimed.manifest_path, claimed.caption),
-            )
+            for platform, result in results.items():
+                send_posted_alert(
+                    clip_id=claimed.clip_id,
+                    author_handle=claimed.author_handle,
+                    platform=platform,
+                    publish_result=result,
+                    details=alert_details(self.config, claimed),
+                    subject=alert_subject(self.config, claimed.clip_id, "Success"),
+                    title=original_title(claimed.manifest_path, claimed.caption),
+                )
             self._record_seen_id(claimed.clip_id)
         self._archive_completed_item(claimed.run_dir)
 

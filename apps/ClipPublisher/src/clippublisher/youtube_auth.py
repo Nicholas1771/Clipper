@@ -63,7 +63,7 @@ def run_youtube_auth(config: AppConfig, *, timeout_seconds: int = 300) -> None:
             "response_type": "code",
             "scope": SCOPE,
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "consent select_account",
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",

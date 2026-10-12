@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from clipscheduler.config import AppConfig
 from common.alerts import send_email_alert
 from common.env import looks_like_windows_path
-from common.platforms import INSTAGRAM, PLATFORMS, YOUTUBE, normalize_platforms
+from common.platforms import INSTAGRAM, PLATFORM_LABELS, PLATFORMS, YOUTUBE, normalize_platforms, publish_only
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class ClipSchedulerRunner:
 
     def _target_slot_count(self, *, remaining_fraction: float, rng: random.Random) -> int:
         """Posts for the remaining window, scaled proportionally with a tight random spread."""
-        posts_per_day = self.config.slots_per_day
+        posts_per_day = max(self._platform_quotas().values())
         target = posts_per_day * max(0.0, min(1.0, remaining_fraction))
         if target <= 0:
             return 0
@@ -128,10 +128,15 @@ class ClipSchedulerRunner:
         return slots
 
     def _platform_quotas(self) -> dict[str, int]:
-        return {
+        quotas = {
             INSTAGRAM: max(0, self.config.instagram_posts_per_day),
             YOUTUBE: max(0, self.config.youtube_posts_per_day),
         }
+        only = publish_only()
+        if only:
+            # --publish: only that platform, at its own rate (or the busier rate if it has none configured).
+            quotas = {name: (max(quotas[name], max(quotas.values())) if name == only else 0) for name in quotas}
+        return quotas
 
     def _assign_platforms(self, count: int, rng: random.Random | None = None) -> list[list[str]]:
         """Randomly pick which slots publish to each platform.
@@ -149,7 +154,7 @@ class ClipSchedulerRunner:
             quota = quotas.get(platform, 0)
             if quota <= 0:
                 continue
-            share = min(count, max(1, round(count * quota / busiest)))
+            share = min(count, max(1, count if quota == busiest else round(quota * min(1.0, count / busiest))))
             for index in sorted(rng.sample(range(count), share)):
                 assignments[index].append(platform)
         return assignments
@@ -201,7 +206,7 @@ class ClipSchedulerRunner:
         next_index = saved.get("next_index")
         next_index = next_index if isinstance(next_index, int) else 0
         saved_platforms = saved.get("platforms")
-        if isinstance(saved_platforms, list) and len(saved_platforms) == len(slots) and all(isinstance(item, list) for item in saved_platforms):
+        if not publish_only() and isinstance(saved_platforms, list) and len(saved_platforms) == len(slots) and all(isinstance(item, list) for item in saved_platforms):
             platforms = [normalize_platforms(item) for item in saved_platforms]
         else:
             platforms = self._assign_platforms(len(slots))
@@ -226,28 +231,40 @@ class ClipSchedulerRunner:
     ) -> None:
         if os.getenv("CLIPPER_TEST_MODE"):
             return
-        remaining = plan.slots[plan.next_index :]
+        for platform in PLATFORMS:
+            if self._platform_quotas().get(platform, 0) <= 0:
+                continue
+            self._send_platform_plan_alert(plan, now, platform, immediate, started=started)
+
+    def _send_platform_plan_alert(
+        self, plan: DayPlan, now: datetime, platform: str, immediate: datetime | None, *, started: bool
+    ) -> None:
+        indexes = [
+            index for index in range(plan.next_index, len(plan.slots)) if platform in plan.platforms_for(index)
+        ]
         lines = []
-        for index, slot in enumerate(remaining, start=plan.next_index + 1):
+        for index in indexes:
+            slot = plan.slots[index]
             overdue = " (overdue, runs on startup)" if slot <= now else ""
-            targets = ", ".join(plan.platforms_for(index - 1)) or "none"
-            lines.append(f"{index}. {slot.strftime('%Y-%m-%d %H:%M:%S %Z')} -> {targets}{overdue}")
+            lines.append(f"{index + 1}. {slot.strftime('%Y-%m-%d %H:%M:%S %Z')}{overdue}")
         if immediate is not None:
             lines.insert(0, f"Immediate run (--now): {immediate.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        planned = sum(1 for index in range(len(plan.slots)) if platform in plan.platforms_for(index))
+        label = PLATFORM_LABELS.get(platform, platform)
         title = "Started" if started else "New schedule"
         body = (
-            f"{title} for {plan.day.strftime('%Y%m%d')} ({self.config.timezone_name}).\n"
+            f"{label} {title} for {plan.day.strftime('%Y%m%d')} ({self.config.timezone_name}).\n"
             f"Window: {self.config.schedule_start_hour:02d}:00-{self.config.schedule_end_hour:02d}:00, "
-            f"posts planned: {len(plan.slots)}, remaining: {len(remaining)}\n\n"
+            f"posts planned: {planned}, remaining: {len(indexes)}\n\n"
             + ("\n".join(lines) if lines else "No runs left in today's window.")
             + "\n"
         )
         day_label = plan.day.strftime("%Y%m%d")
-        subject = f"Started - {day_label}" if started else f"Schedule - {day_label}"
+        subject = f"{'Started' if started else 'Schedule'} - {day_label}"
         try:
-            send_email_alert(app_name="ClipScheduler", subject=subject, body=body)
+            send_email_alert(app_name="ClipScheduler", subject=subject, body=body, platform=label)
         except Exception:
-            logger.exception("Failed to send schedule alert email.")
+            logger.exception("Failed to send %s schedule alert email.", label)
 
     def _save_plan(self, now: datetime) -> None:
         plan = self._plan
@@ -257,7 +274,7 @@ class ClipSchedulerRunner:
             self._plan_path(),
             {
                 "date": plan.day.isoformat(),
-                "posts_per_day": self.config.slots_per_day,
+                "posts_per_day": max(self._platform_quotas().values()),
                 "instagram_posts_per_day": max(0, self.config.instagram_posts_per_day),
                 "youtube_posts_per_day": max(0, self.config.youtube_posts_per_day),
                 "planned_slots": len(plan.slots),
@@ -300,10 +317,9 @@ class ClipSchedulerRunner:
         state_path = self._ready_marker_path()
         save_json(state_path, payload)
         logger.info(
-            "ClipScheduler marked queue ready at %s for slot %s/%s (platforms: %s).",
+            "ClipScheduler marked queue ready at %s for %s (platforms: %s).",
             when.isoformat(),
-            slot_index + 1,
-            len(resolved_slots),
+            f"slot {slot_index + 1}/{len(resolved_slots)}" if slot_index >= 0 else "an immediate (--now) run",
             ", ".join(payload["platforms"]) or "none",
         )
         return state_path
@@ -401,6 +417,19 @@ class ClipSchedulerRunner:
             }
         )
         return payload
+
+    def fire_now(self) -> str:
+        """Start one cycle immediately for every enabled platform, outside the planned slots (works after the window closed)."""
+        now = self._local_now()
+        plan = self.ensure_plan(now, immediate=now)
+        marker = self._mark_ready(
+            when=now,
+            slot_index=-1,
+            completed_slots=plan.next_index,
+            all_slots=plan.slots,
+            now=now,
+        )
+        return str(marker)
 
     def run_once(self, now: datetime | None = None) -> str:
         now = now.astimezone(self._tz) if now is not None else self._local_now()

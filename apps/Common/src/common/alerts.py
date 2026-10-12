@@ -10,7 +10,7 @@ from common.env import parse_bool
 
 logger = logging.getLogger(__name__)
 
-def send_email_alert(*, app_name: str, subject: str, body: str) -> bool:
+def send_email_alert(*, app_name: str, subject: str, body: str, platform: str = "") -> bool:
     enabled = parse_bool(os.getenv("ALERT_EMAIL_ENABLED"), default=True, strict=False)
     if not enabled:
         return False
@@ -34,10 +34,10 @@ def send_email_alert(*, app_name: str, subject: str, body: str) -> bool:
 
     account = os.getenv("ACCOUNT_NAME", "").strip()
     rest = subject.strip()
-    for prefix in ("Clipper", account):
+    for prefix in (platform, "Clipper", account):
         if prefix and rest.lower().startswith(prefix.lower() + " "):
             rest = rest[len(prefix):].strip()
-    subject = " ".join(part for part in ("Clipper", account, rest) if part)
+    subject = " ".join(part for part in (platform or "Clipper", account, rest) if part)
 
     message = EmailMessage()
     message["Subject"] = subject
@@ -69,6 +69,7 @@ def send_failure_alert(
     details: str = "",
     title: str = "",
     subject: str | None = None,
+    platform: str = "",
 ) -> None:
     subject = subject or (f"Clipper Fail - {clip_id}" if clip_id else f"Clipper Fail - {app_name}")
     body = (
@@ -80,4 +81,4 @@ def send_failure_alert(
     )
     if title:
         body += f"\n\nDetails\n{title}\n"
-    send_email_alert(app_name=app_name, subject=subject, body=body)
+    send_email_alert(app_name=app_name, subject=subject, body=body, platform=platform)

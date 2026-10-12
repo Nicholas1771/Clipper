@@ -14,9 +14,8 @@ from test_single_attempt import make_item
 
 def make_runner(tmp: str, platforms: list[str]):
     queue = Path(tmp) / "Queue"
-    run = make_item(queue, "0001_x")
+    make_item(queue, "0001_x")
     (queue / "scheduler_state.json").write_text(json.dumps({"platforms": platforms}), encoding="utf-8")
-    (run / "editor" / "youtube_title.txt").write_text("YT title", encoding="utf-8")
     config = mock.MagicMock(spec=AppConfig)
     config.queue_dir = queue
     config.timezone_name = "UTC"
@@ -56,6 +55,13 @@ class MultiPlatformTests(unittest.TestCase):
             self.assertIn("123", json.loads(seen.read_text())["seen_ids"])
             self.assertIn("youtube.com/shorts/yt1", email.call_args.kwargs["body"])
 
+    def test_publish_flag_limits_a_slot_to_one_platform(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict("os.environ", {"CLIPPER_PUBLISH_ONLY": "instagram"}):
+            _, _, ig, yt, _, _, error = self.run_once(tmp, ["instagram", "youtube"])
+            self.assertIsNone(error)
+            ig.assert_called_once()
+            yt.assert_not_called()
+
     def test_both_platforms_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, ig, yt, fail_alert, _, error = self.run_once(tmp, ["instagram", "youtube"])
@@ -71,10 +77,10 @@ class MultiPlatformTests(unittest.TestCase):
             self.assertIsNone(error)
             ig.assert_called_once()
             fail_alert.assert_called_once()
-            self.assertIn("Fail YouTube", fail_alert.call_args.kwargs["subject"])
+            self.assertEqual("YouTube", fail_alert.call_args.kwargs["platform"])
             self.assertTrue((queue / "Archive" / "0001_x").exists())
             self.assertIn("123", json.loads(seen.read_text())["seen_ids"])
-            self.assertIn("YouTube FAILED", email.call_args.kwargs["body"])
+            self.assertEqual("Instagram", email.call_args.kwargs["platform"])
 
     def test_instagram_failure_does_not_block_youtube(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,29 +124,38 @@ class YouTubeMetadataTests(unittest.TestCase):
             setattr(config, key, value)
         return config
 
-    def test_title_is_limited_and_shorts_tag_added(self):
-        meta = youtube_client.build_video_metadata(
-            self.config(), self.item(youtube_title="x" * 150, youtube_description="desc")
-        )
-        self.assertEqual(100, len(meta["snippet"]["title"]))
-        self.assertTrue(meta["snippet"]["description"].endswith("#Shorts"))
+    def test_title_is_ai_text_plus_hashtags_with_no_description(self):
+        config = self.config(streamer_hashtag="kai")
+        item = self.item(caption="source caption", description="Wild clutch play.\n\nSecond paragraph.\n\n#clutch #KAI #fun")
+        self.assertEqual("Wild clutch play. #kai #clutch #fun", youtube_client.build_title(config, item))
+        meta = youtube_client.build_video_metadata(config, item)
+        self.assertEqual("", meta["snippet"]["description"])
         self.assertEqual("public", meta["status"]["privacyStatus"])
         self.assertFalse(meta["status"]["selfDeclaredMadeForKids"])
 
-    def test_hashtags_follow_description_after_a_space(self):
+    def test_title_uses_the_youtube_ai_caption_not_the_instagram_summary(self):
         config = self.config(streamer_hashtag="kai")
-        item = self.item(youtube_description="Great play.\n\n#clutch #KAI #fun")
-        self.assertEqual("Great play. #kai #clutch #fun #Shorts", youtube_client.build_description(config, item))
-
-    def test_streamer_tag_added_when_description_has_no_tags(self):
+        item = self.item(description="Long instagram summary paragraph.\n\n#clutch #fun", youtube_description="Wild CLUTCH play 🔥")
+        self.assertEqual("Wild CLUTCH play 🔥 #kai #clutch #fun", youtube_client.build_title(config, item))
+    def test_hashtags_that_do_not_fit_are_dropped(self):
         config = self.config(streamer_hashtag="kai")
-        self.assertEqual("Nice. #kai #Shorts", youtube_client.build_description(config, self.item(youtube_description="Nice.")))
+        text = "x" * 80
+        item = self.item(description=f"{text}\n\n#abcdef #ghijklmnopqrstuvwxyz #zz")
+        title = youtube_client.build_title(config, item)
+        self.assertLessEqual(len(title), 100)
+        self.assertEqual(f"{text} #kai #abcdef #zz", title)
 
-    def test_falls_back_to_instagram_description_and_validates_privacy(self):
-        meta = youtube_client.build_video_metadata(
-            self.config(youtube_privacy_status="bogus"), self.item(description="ig text <b>")
-        )
-        self.assertIn("ig text b", meta["snippet"]["description"])
+    def test_long_text_is_cut_on_a_word_boundary_and_leaves_no_tags(self):
+        config = self.config(streamer_hashtag="kai")
+        title = youtube_client.build_title(config, self.item(description=("word " * 40).strip() + "\n\n#a"))
+        self.assertLessEqual(len(title), 100)
+        self.assertTrue(title.endswith("word"))
+
+    def test_falls_back_to_caption_when_no_ai_text(self):
+        self.assertEqual("cap", youtube_client.build_title(self.config(streamer_hashtag=""), self.item()))
+
+    def test_invalid_privacy_falls_back_to_public(self):
+        meta = youtube_client.build_video_metadata(self.config(youtube_privacy_status="bogus"), self.item())
         self.assertEqual("public", meta["status"]["privacyStatus"])
 
     def test_configured_requires_credentials_and_token(self):

@@ -1,1 +1,5 @@
-Write 3 long paragraph summary (3-4 sentences each, 9-12 sentences total), each paragraph separated by a blank line, of streamer __STREAMER__. No emojis or headers. Paragraphs separated by newlines.
+Write 3 long paragraph summary (3-4 sentences each, 9-12 sentences total) of streamer __STREAMER__.
+
+Rules:
+Do not use emojis or headers.
+Separate paragraphs by a blank line.

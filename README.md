@@ -66,8 +66,9 @@ Load order is now: process env > `profiles\<name>.env` > `apps\<AppName>\.env` >
 
 Each profile can also upload to YouTube. Set `INSTAGRAM_POSTS_PER_DAY` and `YOUTUBE_POSTS_PER_DAY` in the profile (`YOUTUBE_POSTS_PER_DAY=0` disables YouTube). The scheduler plans `max(instagram, youtube)` slots per day; the busier platform posts in every slot and the other is randomly assigned to a subset. Each slot's platforms are stored in `scheduler_state.json`, and ClipPublisher publishes only to those.
 
-- YouTube descriptions come from `data/prompts/youtube_description.txt` (placeholders `__CAPTION__`, `__TRANSCRIPT__`, `__STREAMER__`, `__CONTEXT_SUFFICIENT__`). If generation fails, the Instagram summary is used.
+- The Short's title is the AI caption followed by the streamer hashtag and the AI hashtags, all in the title (100 characters max; hashtags that would not fit are dropped). Shorts have no description.
 - One-time login per profile: `$env:CLIPPER_PROFILE='n3on'; python apps\ClipPublisher\main.py --youtube-auth` (needs `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` in the root `.env`). The refresh token is saved to `YOUTUBE_TOKEN_FILE` (git-ignored).
+- `--publish youtube` or `--publish instagram` on `run_all_apps.py` restricts the run to one platform: every slot targets only that platform (at its own posts-per-day, or the busier rate if it has none), overriding any saved plan. Example: `python run_all_apps.py --n3on --now --publish youtube`.
 - A slot assigned to YouTube while no token exists is skipped with a warning. Platforms publish independently, so one failing does not block the other.
 
 ## Run all 5 apps together (recommended)

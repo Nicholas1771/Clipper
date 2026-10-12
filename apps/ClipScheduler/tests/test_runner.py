@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -199,6 +201,33 @@ class PlatformAssignmentTests(unittest.TestCase):
         resumed = make_runner(self.queue).ensure_plan(at(7))
         self.assertEqual(plan.slots, resumed.slots)
         self.assertEqual(len(plan.slots), len(resumed.platforms))
+
+    def test_fire_now_after_the_window_still_starts_an_immediate_cycle(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3)
+        late = at(23, 30)
+        runner._local_now = lambda: late
+        marker = runner.fire_now()
+        state = json.loads(Path(marker).read_text(encoding="utf-8"))
+        self.assertEqual("scheduled", state["phase"])
+        self.assertEqual(-1, state["slot_index"])
+        self.assertEqual(["instagram", "youtube"], state["platforms"])
+        self.assertEqual(late.isoformat(), state["scheduled_for"])
+        self.assertEqual(marker, runner.run_once(late))
+        self.assertEqual("scheduled", self.state()["phase"])
+
+    def test_publish_only_restricts_every_slot_to_one_platform(self) -> None:
+        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "youtube"}):
+            runner = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=2)
+            self.assertEqual({"instagram": 0, "youtube": 6}, runner._platform_quotas())
+            self.assertEqual([["youtube"]] * 6, runner._assign_platforms(6))
+            runner._mark_ready(when=at(12))
+            self.assertEqual(["youtube"], self.state()["platforms"])
+
+    def test_publish_only_overrides_a_saved_plan(self) -> None:
+        make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3).ensure_plan(at(6))
+        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "instagram"}):
+            plan = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3).ensure_plan(at(7))
+        self.assertTrue(all(slot == ["instagram"] for slot in plan.platforms))
 
     def test_forced_cycle_targets_every_enabled_platform(self) -> None:
         runner = make_runner(self.queue, instagram_posts_per_day=2, youtube_posts_per_day=1)

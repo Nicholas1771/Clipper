@@ -5,7 +5,7 @@ Transcript of the clip: "__TRANSCRIPT__"
 
 Rules:
 - Plain text only, no markdown or headers.
-- Add 1-2 emojis, with no space, directly at the end of the caption to enhance engagement.
+- Add 1-2 emojis, with no spaces, directly at the end of the caption to enhance engagement.
 - Capitalize a few key words in the caption to draw attention to important points.
 - Do not mention the transcript, caption, or stream directly, but use them to inform the caption. Do not quote them directly.
 - Return only the caption text.
