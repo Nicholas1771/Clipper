@@ -39,6 +39,11 @@ class AppConfig:
     posting_peak_minute: int
     posting_grace_minutes: int
     timezone_name: str
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_token_file: Path = Path("data/state/youtube_token.json")
+    youtube_privacy_status: str = "public"
+    youtube_category_id: str = "24"
 
     @classmethod
     def from_repo_root(cls, repo_root: Path, *, resolve_media_url: bool = True) -> "AppConfig":
@@ -64,7 +69,19 @@ class AppConfig:
         elif resolve_media_url and not media_base_url:
             media_base_url = resolve_media_base_url(queue_dir)
 
+        youtube_token_raw = os.getenv("YOUTUBE_TOKEN_FILE", "data/state/youtube_token.json").strip()
+        if os.name != "nt" and looks_like_windows_path(youtube_token_raw):
+            youtube_token_raw = "data/state/youtube_token.json"
+        youtube_token_file = Path(youtube_token_raw).expanduser()
+        if not youtube_token_file.is_absolute():
+            youtube_token_file = root_dir / youtube_token_file
+
         return cls(
+            youtube_client_id=os.getenv("YOUTUBE_CLIENT_ID", "").strip(),
+            youtube_client_secret=os.getenv("YOUTUBE_CLIENT_SECRET", "").strip(),
+            youtube_token_file=youtube_token_file,
+            youtube_privacy_status=os.getenv("YOUTUBE_PRIVACY_STATUS", "public").strip().lower() or "public",
+            youtube_category_id=os.getenv("YOUTUBE_CATEGORY_ID", "24").strip() or "24",
             queue_dir=queue_dir,
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "60")),
             ready_stability_seconds=int(os.getenv("READY_STABILITY_SECONDS", "5")),

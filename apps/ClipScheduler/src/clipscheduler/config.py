@@ -14,9 +14,15 @@ class AppConfig:
     schedule_start_hour: int
     schedule_end_hour: int
     schedule_peak_hour: int
-    posts_per_day: int
+    instagram_posts_per_day: int
     min_gap_minutes: int
     timezone_name: str
+    youtube_posts_per_day: int = 0
+
+    @property
+    def slots_per_day(self) -> int:
+        """One slot per clip: as many as the busiest platform needs."""
+        return max(0, self.instagram_posts_per_day, self.youtube_posts_per_day)
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
@@ -33,7 +39,8 @@ class AppConfig:
             schedule_start_hour=int(os.getenv("SCHEDULE_START_HOUR", "17")),
             schedule_end_hour=int(os.getenv("SCHEDULE_END_HOUR", "19")),
             schedule_peak_hour=int(os.getenv("SCHEDULE_PEAK_HOUR", "18")),
-            posts_per_day=int(os.getenv("POSTS_PER_DAY", "5")),
+            instagram_posts_per_day=int(os.getenv("INSTAGRAM_POSTS_PER_DAY", "").strip() or os.getenv("POSTS_PER_DAY", "5")),
             min_gap_minutes=int(os.getenv("MIN_GAP_MINUTES", "75")),
             timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
+            youtube_posts_per_day=int(os.getenv("YOUTUBE_POSTS_PER_DAY", "").strip() or "0"),
         )

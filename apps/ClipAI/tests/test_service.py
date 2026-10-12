@@ -117,5 +117,48 @@ class ClipAITests(unittest.TestCase):
             self.assertEqual(3, scheduler_state["slot_index"])
 
 
+class YouTubeDescriptionTests(unittest.TestCase):
+    def make_service(self, tmp: str) -> ClipAIService:
+        prompts = Path(tmp) / "prompts"
+        prompts.mkdir(exist_ok=True)
+        (prompts / "youtube_description.txt").write_text("YT __STREAMER__: __CAPTION__ | __TRANSCRIPT__ | __CONTEXT_SUFFICIENT__", encoding="utf-8")
+        return ClipAIService(AppConfig(
+            queue_dir=Path(tmp), poll_interval_seconds=60, google_api_key="k", prompts_dir=prompts,
+            gemini_model="m", timeout_seconds=30, timezone_name="America/New_York", streamer_name="Sample",
+        ))
+
+    def context(self) -> dict:
+        return {"caption": "Big play", "transcript": "wow", "context_sufficient": True}
+
+    def test_writes_youtube_files_from_dedicated_prompt(self) -> None:
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(tmp)
+            run_dir = Path(tmp) / "run"
+            (run_dir / "ai").mkdir(parents=True)
+            with patch.object(service, "_call_gemini", return_value={"text": "A  desc\n\n\n#tag"}) as call:
+                result = service._write_youtube_files(run_dir, self.context(), "ig summary")
+            self.assertEqual("YT Sample: Big play | wow | yes", call.call_args.args[0])
+            self.assertEqual("A desc\n\n#tag", result)
+            self.assertEqual("A desc\n\n#tag", (run_dir / "ai" / "youtube_description.txt").read_text(encoding="utf-8"))
+            self.assertEqual("Big play", (run_dir / "ai" / "youtube_title.txt").read_text(encoding="utf-8"))
+
+    def test_falls_back_to_instagram_summary_when_generation_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(tmp)
+            run_dir = Path(tmp) / "run"
+            (run_dir / "ai").mkdir(parents=True)
+            with patch.object(service, "_call_gemini", side_effect=RuntimeError("boom")):
+                result = service._write_youtube_files(run_dir, self.context(), "ig summary")
+            self.assertEqual("ig summary", result)
+            self.assertEqual("ig summary", (run_dir / "ai" / "youtube_description.txt").read_text(encoding="utf-8"))
+
+    def test_title_is_capped_on_a_word_boundary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            title = self.make_service(tmp)._youtube_title("word " * 40)
+            self.assertLessEqual(len(title), 100)
+            self.assertTrue(title.endswith("word"))
+            self.assertEqual("Sample clip", self.make_service(tmp)._youtube_title("  "))
+
+
 if __name__ == "__main__":
     unittest.main()

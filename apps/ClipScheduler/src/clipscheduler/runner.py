@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from clipscheduler.config import AppConfig
 from common.alerts import send_email_alert
 from common.env import looks_like_windows_path
+from common.platforms import INSTAGRAM, PLATFORMS, YOUTUBE, normalize_platforms
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ class DayPlan:
     day: date
     slots: list[datetime]
     next_index: int = 0
+    platforms: list[list[str]] = field(default_factory=list)
+
+    def platforms_for(self, index: int) -> list[str]:
+        return list(self.platforms[index]) if 0 <= index < len(self.platforms) else [INSTAGRAM]
 
 
 class ClipSchedulerRunner:
@@ -78,7 +83,7 @@ class ClipSchedulerRunner:
 
     def _target_slot_count(self, *, remaining_fraction: float, rng: random.Random) -> int:
         """Posts for the remaining window, scaled proportionally with a tight random spread."""
-        posts_per_day = max(0, self.config.posts_per_day)
+        posts_per_day = self.config.slots_per_day
         target = posts_per_day * max(0.0, min(1.0, remaining_fraction))
         if target <= 0:
             return 0
@@ -122,6 +127,33 @@ class ClipSchedulerRunner:
             slots.append(datetime.fromtimestamp(base_ts + compressed + index * gap, tz=self._tz))
         return slots
 
+    def _platform_quotas(self) -> dict[str, int]:
+        return {
+            INSTAGRAM: max(0, self.config.instagram_posts_per_day),
+            YOUTUBE: max(0, self.config.youtube_posts_per_day),
+        }
+
+    def _assign_platforms(self, count: int, rng: random.Random | None = None) -> list[list[str]]:
+        """Randomly pick which slots publish to each platform.
+
+        The busiest platform takes every slot; the others take a random subset sized in
+        proportion to their posts-per-day (at least one while they are enabled).
+        """
+        rng = rng or self._rng
+        assignments: list[list[str]] = [[] for _ in range(max(0, count))]
+        quotas = self._platform_quotas()
+        busiest = max(quotas.values())
+        if count <= 0 or busiest <= 0:
+            return assignments
+        for platform in PLATFORMS:
+            quota = quotas.get(platform, 0)
+            if quota <= 0:
+                continue
+            share = min(count, max(1, round(count * quota / busiest)))
+            for index in sorted(rng.sample(range(count), share)):
+                assignments[index].append(platform)
+        return assignments
+
     def ensure_plan(self, now: datetime, immediate: datetime | None = None) -> DayPlan:
         today = now.date()
         if self._plan is not None and self._plan.day == today:
@@ -143,13 +175,16 @@ class ClipSchedulerRunner:
             )
         else:
             slots = self._generate_daily_slots(now)
-            self._plan = DayPlan(day=today, slots=slots)
+            self._plan = DayPlan(day=today, slots=slots, platforms=self._assign_platforms(len(slots)))
             self._save_plan(now)
             logger.info(
                 "ClipScheduler generated %s slot(s) for %s: %s",
                 len(slots),
                 today.isoformat(),
-                [slot.strftime("%Y-%m-%d %H:%M:%S %Z") for slot in slots],
+                [
+                    f"{slot.strftime('%Y-%m-%d %H:%M:%S %Z')} [{'+'.join(self._plan.platforms_for(index))}]"
+                    for index, slot in enumerate(slots)
+                ],
             )
         if immediate is not None:
             logger.info("ClipScheduler immediate run (--now) at %s, outside the planned slots.", immediate.strftime("%Y-%m-%d %H:%M:%S %Z"))
@@ -165,7 +200,12 @@ class ClipSchedulerRunner:
             return None
         next_index = saved.get("next_index")
         next_index = next_index if isinstance(next_index, int) else 0
-        return DayPlan(day=today, slots=slots, next_index=max(0, min(next_index, len(slots))))
+        saved_platforms = saved.get("platforms")
+        if isinstance(saved_platforms, list) and len(saved_platforms) == len(slots) and all(isinstance(item, list) for item in saved_platforms):
+            platforms = [normalize_platforms(item) for item in saved_platforms]
+        else:
+            platforms = self._assign_platforms(len(slots))
+        return DayPlan(day=today, slots=slots, next_index=max(0, min(next_index, len(slots))), platforms=platforms)
 
     def prepare_startup(self) -> None:
         """Keep today's saved plan across restarts; drop only the interrupted cycle so its slot runs again."""
@@ -190,7 +230,8 @@ class ClipSchedulerRunner:
         lines = []
         for index, slot in enumerate(remaining, start=plan.next_index + 1):
             overdue = " (overdue, runs on startup)" if slot <= now else ""
-            lines.append(f"{index}. {slot.strftime('%Y-%m-%d %H:%M:%S %Z')}{overdue}")
+            targets = ", ".join(plan.platforms_for(index - 1)) or "none"
+            lines.append(f"{index}. {slot.strftime('%Y-%m-%d %H:%M:%S %Z')} -> {targets}{overdue}")
         if immediate is not None:
             lines.insert(0, f"Immediate run (--now): {immediate.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         title = "Started" if started else "New schedule"
@@ -216,9 +257,12 @@ class ClipSchedulerRunner:
             self._plan_path(),
             {
                 "date": plan.day.isoformat(),
-                "posts_per_day": max(0, self.config.posts_per_day),
+                "posts_per_day": self.config.slots_per_day,
+                "instagram_posts_per_day": max(0, self.config.instagram_posts_per_day),
+                "youtube_posts_per_day": max(0, self.config.youtube_posts_per_day),
                 "planned_slots": len(plan.slots),
                 "slots": [slot.isoformat() for slot in plan.slots],
+                "platforms": plan.platforms,
                 "future_slots": [slot.isoformat() for slot in plan.slots[plan.next_index :]],
                 "next_index": plan.next_index,
                 "updated_at": now.isoformat(),
@@ -237,8 +281,10 @@ class ClipSchedulerRunner:
         completed_slots: int = 0,
         all_slots: list[datetime] | None = None,
         now: datetime | None = None,
+        platforms: list[str] | None = None,
     ) -> Path:
         resolved_slots = list(all_slots or [when])
+        resolved_platforms = platforms if platforms is not None else [name for name, quota in self._platform_quotas().items() if quota > 0]
         payload = {
             "date": when.date().isoformat(),
             "phase": "scheduled",
@@ -248,15 +294,17 @@ class ClipSchedulerRunner:
             "completed_slots": completed_slots,
             "total_slots": len(resolved_slots),
             "slots": [slot.isoformat() for slot in resolved_slots],
+            "platforms": normalize_platforms(resolved_platforms),
             "updated_at": (now or datetime.now(self._tz)).isoformat(),
         }
         state_path = self._ready_marker_path()
         save_json(state_path, payload)
         logger.info(
-            "ClipScheduler marked queue ready at %s for slot %s/%s.",
+            "ClipScheduler marked queue ready at %s for slot %s/%s (platforms: %s).",
             when.isoformat(),
             slot_index + 1,
             len(resolved_slots),
+            ", ".join(payload["platforms"]) or "none",
         )
         return state_path
     def clear_schedule_artifacts(self) -> None:
@@ -412,6 +460,7 @@ class ClipSchedulerRunner:
             completed_slots=fire_index,
             all_slots=plan.slots,
             now=now,
+            platforms=plan.platforms_for(fire_index),
         )
         plan.next_index = fire_index + 1
         self._save_plan(now)

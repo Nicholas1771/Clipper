@@ -13,3 +13,5 @@ class QueueItem:
     caption: str
     author_handle: str
     description: str = ""
+    youtube_title: str = ""
+    youtube_description: str = ""

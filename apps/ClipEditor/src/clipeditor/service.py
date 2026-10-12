@@ -80,6 +80,10 @@ class ClipEditorService:
         (editor_dir / "caption.txt").write_text(caption, encoding="utf-8")
         (editor_dir / "title.txt").write_text(title, encoding="utf-8")
         (editor_dir / "description.txt").write_text(description, encoding="utf-8")
+        for name in ("youtube_title.txt", "youtube_description.txt"):
+            ai_file = run_dir / "ai" / name
+            if ai_file.exists():
+                (editor_dir / name).write_text(ai_file.read_text(encoding="utf-8").strip(), encoding="utf-8")
 
     def _video_dimensions(self, source_video: Path) -> tuple[int, int] | None:
         ffmpeg_exe = str(get_ffmpeg_exe())

@@ -15,6 +15,7 @@ import requests
 from imageio_ffmpeg import get_ffmpeg_exe
 
 from common.alerts import send_failure_alert
+from common.platforms import YOUTUBE, read_slot_platforms
 from clipai.config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,12 @@ class ClipAIService:
 
     def _summary_path(self, run_dir: Path) -> Path:
         return run_dir / "ai" / "summary.txt"
+
+    def _youtube_description_path(self, run_dir: Path) -> Path:
+        return run_dir / "ai" / "youtube_description.txt"
+
+    def _youtube_title_path(self, run_dir: Path) -> Path:
+        return run_dir / "ai" / "youtube_title.txt"
 
     def _manifest_path(self, run_dir: Path) -> Path | None:
         source_dir = run_dir / "source"
@@ -151,6 +158,18 @@ class ClipAIService:
         return self._fill_prompt(
             template,
             {"CAPTION": caption, "TRANSCRIPT": transcript, "STREAMER": self.config.streamer_name},
+        )
+
+    def _build_youtube_prompt(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+        template = self._read_prompt_template("youtube_description.txt")
+        return self._fill_prompt(
+            template,
+            {
+                "CAPTION": caption,
+                "TRANSCRIPT": transcript,
+                "STREAMER": self.config.streamer_name,
+                "CONTEXT_SUFFICIENT": "yes" if context_sufficient else "no",
+            },
         )
 
     def _extract_retry_delay_seconds(self, payload_error: dict[str, Any]) -> int | None:
@@ -544,6 +563,37 @@ class ClipAIService:
         parts = [re.sub(r"\s+", " ", part).strip() for part in re.split(r"\n\s*\n", summary)]
         return "\n\n".join(part for part in parts if part)
 
+    def _generate_youtube_description(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+        payload = self._call_gemini(
+            self._build_youtube_prompt(caption, transcript, context_sufficient), plain_text=True
+        )
+        text = str(payload.get("text") or "").replace("\r", "\n").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty YouTube description.")
+        parts = [re.sub(r"[ \t]+", " ", part).strip() for part in re.split(r"\n\s*\n", text)]
+        return "\n\n".join(part for part in parts if part)
+
+    def _youtube_title(self, caption: str) -> str:
+        """Title (100 character YouTube limit) from the cleaned source caption, cut on a word boundary."""
+        title = re.sub(r"\s+", " ", caption).strip().replace("<", "").replace(">", "")
+        if not title:
+            return f"{self.config.streamer_name} clip".strip() or "Clip"
+        if len(title) > 100:
+            title = title[:100].rsplit(" ", 1)[0].rstrip(" ,;:-") or title[:100]
+        return title
+
+    def _write_youtube_files(self, run_dir: Path, clip_context: dict[str, Any], fallback_description: str) -> str:
+        description = fallback_description
+        try:
+            description = self._generate_youtube_description(
+                clip_context["caption"], clip_context["transcript"], clip_context["context_sufficient"]
+            )
+        except Exception:
+            logger.exception("Could not generate the YouTube description for %s; using the Instagram summary instead.", run_dir.name)
+        self._youtube_description_path(run_dir).write_text(description, encoding="utf-8")
+        self._youtube_title_path(run_dir).write_text(self._youtube_title(clip_context["caption"]), encoding="utf-8")
+        return description
+
     def _load_state(self, run_dir: Path) -> dict[str, Any]:
         return _read_json(self._queue_state_path(run_dir))
 
@@ -597,6 +647,10 @@ class ClipAIService:
             summary = self._generate_summary(clip_context["caption"], clip_context["transcript"], context_sufficient)
             hashtags = clip_context["hashtags"]
             (ai_dir / "transcript.txt").write_text(clip_context["transcript"], encoding="utf-8")
+            platforms = read_slot_platforms(self.config.queue_dir)
+            youtube_description = (
+                self._write_youtube_files(run_dir, clip_context, summary) if YOUTUBE in platforms else None
+            )
             analysis = {
                 "has_kick_overlay": has_kick_overlay,
                 "has_caption": has_caption,
@@ -606,6 +660,8 @@ class ClipAIService:
                 "context_sufficient": context_sufficient,
                 "hashtags": hashtags,
                 "summary": summary,
+                "platforms": platforms,
+                "youtube_description": youtube_description,
                 "updated_at": datetime.now(self._tz).isoformat(),
             }
             _write_json(self._analysis_path(run_dir), analysis)

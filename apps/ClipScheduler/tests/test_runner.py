@@ -30,7 +30,7 @@ def make_runner(queue_dir: Path, seed: int = 1, **overrides) -> ClipSchedulerRun
         schedule_start_hour=10,
         schedule_end_hour=22,
         schedule_peak_hour=17,
-        posts_per_day=12,
+        instagram_posts_per_day=12,
         min_gap_minutes=10,
         timezone_name="America/New_York",
     )
@@ -107,7 +107,7 @@ class SlotGenerationTests(unittest.TestCase):
         self.assert_valid(slots, at(10), at(22), gap_seconds=7200)
 
     def test_zero_posts(self) -> None:
-        self.assertEqual([], make_runner(self.queue, posts_per_day=0)._generate_daily_slots(at(6)))
+        self.assertEqual([], make_runner(self.queue, instagram_posts_per_day=0)._generate_daily_slots(at(6)))
 
     def test_dst_days_keep_gap_and_window(self) -> None:
         for day, month in ((8, 3), (1, 11)):
@@ -122,6 +122,88 @@ class SlotGenerationTests(unittest.TestCase):
     def test_invalid_window_raises(self) -> None:
         with self.assertRaises(ValueError):
             make_runner(self.queue, schedule_start_hour=12, schedule_end_hour=12)._generate_daily_slots(at(6))
+
+
+class PlatformAssignmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue = Path(self._tmp.name)
+
+    def state(self) -> dict:
+        return json.loads((self.queue / "scheduler_state.json").read_text(encoding="utf-8"))
+
+    def test_instagram_only_by_default(self) -> None:
+        runner = make_runner(self.queue)
+        plan = runner.ensure_plan(at(6))
+        self.assertEqual([["instagram"]] * len(plan.slots), plan.platforms)
+
+    def test_slot_count_follows_the_busier_platform(self) -> None:
+        counts = []
+        for seed in range(200):
+            runner = make_runner(self.queue, seed, instagram_posts_per_day=3, youtube_posts_per_day=12)
+            counts.append(len(runner._generate_daily_slots(at(6))))
+        self.assertAlmostEqual(sum(counts) / len(counts), 12, delta=0.5)
+
+    def test_every_slot_is_used_and_the_lighter_platform_gets_a_random_subset(self) -> None:
+        youtube_positions = set()
+        for seed in range(200):
+            runner = make_runner(self.queue, seed, instagram_posts_per_day=12, youtube_posts_per_day=4)
+            platforms = runner._assign_platforms(12)
+            self.assertEqual(12, len(platforms))
+            self.assertTrue(all("instagram" in slot for slot in platforms))
+            youtube = [index for index, slot in enumerate(platforms) if "youtube" in slot]
+            self.assertEqual(4, len(youtube))
+            youtube_positions.update(youtube)
+        self.assertEqual(set(range(12)), youtube_positions)
+
+    def test_youtube_can_be_the_busier_platform(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=2, youtube_posts_per_day=8)
+        platforms = runner._assign_platforms(8)
+        self.assertTrue(all("youtube" in slot for slot in platforms))
+        self.assertEqual(2, sum("instagram" in slot for slot in platforms))
+
+    def test_enabled_platform_always_gets_at_least_one_slot(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=20, youtube_posts_per_day=1)
+        platforms = runner._assign_platforms(3)
+        self.assertEqual(1, sum("youtube" in slot for slot in platforms))
+
+    def test_disabled_platform_is_never_assigned(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=0, youtube_posts_per_day=5)
+        platforms = runner._assign_platforms(5)
+        self.assertEqual([["youtube"]] * 5, platforms)
+        self.assertEqual([], make_runner(self.queue, instagram_posts_per_day=0)._assign_platforms(4)[0])
+
+    def test_fired_slot_publishes_its_assigned_platforms(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3)
+        plan = runner.ensure_plan(at(6))
+        runner.run_once(plan.slots[0])
+        self.assertEqual(plan.platforms[0], self.state()["platforms"])
+        plan_file = json.loads((self.queue / "scheduler_plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(plan.platforms, plan_file["platforms"])
+        self.assertEqual(3, plan_file["youtube_posts_per_day"])
+
+    def test_assignment_survives_a_restart(self) -> None:
+        first = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3)
+        original = first.ensure_plan(at(6)).platforms
+        second = make_runner(self.queue, 77, instagram_posts_per_day=6, youtube_posts_per_day=3)
+        self.assertEqual(original, second.ensure_plan(at(7)).platforms)
+
+    def test_old_plan_without_platforms_is_upgraded(self) -> None:
+        first = make_runner(self.queue)
+        plan = first.ensure_plan(at(6))
+        plan_path = self.queue / "scheduler_plan.json"
+        saved = json.loads(plan_path.read_text(encoding="utf-8"))
+        del saved["platforms"]
+        plan_path.write_text(json.dumps(saved), encoding="utf-8")
+        resumed = make_runner(self.queue).ensure_plan(at(7))
+        self.assertEqual(plan.slots, resumed.slots)
+        self.assertEqual(len(plan.slots), len(resumed.platforms))
+
+    def test_forced_cycle_targets_every_enabled_platform(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=2, youtube_posts_per_day=1)
+        runner._mark_ready(when=at(12))
+        self.assertEqual(["instagram", "youtube"], self.state()["platforms"])
 
 
 class RunOnceTests(unittest.TestCase):

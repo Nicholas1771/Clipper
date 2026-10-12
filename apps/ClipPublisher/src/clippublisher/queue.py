@@ -20,6 +20,10 @@ def _read_manifest(manifest_path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+
+
 def _read_queue_state(run_dir: Path) -> dict:
     state_path = run_dir / "queue_state.json"
     if not state_path.exists():
@@ -85,6 +89,8 @@ def discover_queue_items(config: AppConfig) -> list[QueueItem]:
         description_file = child / "editor" / "description.txt"
         if description_file.exists():
             description = description_file.read_text(encoding="utf-8").strip()
+        youtube_title = _read_text(child / "editor" / "youtube_title.txt")
+        youtube_description = _read_text(child / "editor" / "youtube_description.txt")
         items.append(
             QueueItem(
                 run_dir=child,
@@ -94,6 +100,8 @@ def discover_queue_items(config: AppConfig) -> list[QueueItem]:
                 caption=caption,
                 author_handle=author_handle,
                 description=description,
+                youtube_title=youtube_title,
+                youtube_description=youtube_description,
             )
         )
     return items
@@ -189,4 +197,6 @@ def claim_item(config: AppConfig, item: QueueItem) -> QueueItem:
         caption=item.caption,
         author_handle=item.author_handle,
         description=item.description,
+        youtube_title=item.youtube_title,
+        youtube_description=item.youtube_description,
     )

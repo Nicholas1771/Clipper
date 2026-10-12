@@ -14,6 +14,8 @@ from clippublisher.config import AppConfig
 from common.alerts import send_email_alert, send_failure_alert
 from clippublisher.instagram_client import publish_to_instagram
 from clippublisher.queue import claim_item, discover_queue_items, is_item_ready
+from clippublisher.youtube_client import is_configured as youtube_is_configured, publish_to_youtube
+from common.platforms import INSTAGRAM, YOUTUBE, read_slot_platforms
 from clippublisher.token_manager import resolve_publish_access_token
 
 
@@ -78,14 +80,26 @@ def alert_subject(config: AppConfig, clip_id: str, outcome: str) -> str:
     return f"{account}{position} {outcome} - {clip_id}"
 
 
-def send_posted_alert(*, clip_id: str, author_handle: str, publish_result: dict[str, Any], details: str = "", title: str = "", subject: str | None = None) -> None:
-    media_id = str(publish_result.get("id") or "")
+PLATFORM_LABELS = {INSTAGRAM: "Instagram", YOUTUBE: "YouTube"}
+
+
+def send_posted_alert(*, clip_id: str, author_handle: str, publish_result: dict[str, Any] | None = None, details: str = "", title: str = "", subject: str | None = None, results: dict[str, Any] | None = None, failures: dict[str, Exception] | None = None) -> None:
+    results = dict(results) if results else {INSTAGRAM: publish_result or {}}
     subject = subject or f"Clipper Success - {clip_id}"
+    lines = []
+    for platform, result in results.items():
+        result = result if isinstance(result, dict) else {}
+        if platform == YOUTUBE:
+            lines.append(f"YouTube video: {result.get('url') or result.get('id') or 'unknown'}")
+        else:
+            lines.append(f"Instagram publish id: {result.get('id') or 'unknown'}")
+    for platform, error in (failures or {}).items():
+        lines.append(f"{PLATFORM_LABELS.get(platform, platform)} FAILED: {error}")
     body = (
         f"Clip posted successfully.\n"
         f"Clip ID: {clip_id}\n"
         f"{details or f'Author: @{author_handle}' + chr(10)}"
-        f"Instagram publish id: {media_id or 'unknown'}\n"
+        + "\n".join(lines) + "\n"
     )
     if title:
         body += f"\n\nDetails\n{title}\n"
@@ -180,6 +194,71 @@ class QueuePublisherRunner:
                 return True
         return False
 
+    def _publish_claimed(self, claimed: Any, platforms: list[str]) -> None:
+        """Attempt each assigned platform once, independently. Raises only if every attempted platform failed."""
+        results: dict[str, Any] = {}
+        failures: dict[str, Exception] = {}
+        skipped: list[str] = []
+        for platform in platforms:
+            try:
+                if platform == INSTAGRAM:
+                    publish_token = resolve_publish_access_token(self.config)
+                    results[platform] = publish_to_instagram(self.config, claimed, access_token=publish_token)
+                elif platform == YOUTUBE:
+                    if not youtube_is_configured(self.config):
+                        logger.warning("YouTube is assigned to %s but not configured (credentials or token file missing); skipping.", claimed.run_dir.name)
+                        skipped.append(platform)
+                        continue
+                    results[platform] = publish_to_youtube(self.config, claimed)
+                else:
+                    continue
+                logger.info("%s publish response for %s: %s", PLATFORM_LABELS.get(platform, platform), claimed.run_dir.name, results[platform])
+            except Exception as error:
+                failures[platform] = error
+                logger.exception("%s publish failed for %s: %s", PLATFORM_LABELS.get(platform, platform), claimed.run_dir.name, error)
+                outcome = "Fail" if platforms == [INSTAGRAM] else f"Fail {PLATFORM_LABELS.get(platform, platform)}"
+                send_failure_alert(
+                    app_name="ClipPublisher",
+                    error=error,
+                    context=f"{PLATFORM_LABELS.get(platform, platform)} publish failure for {claimed.run_dir.name}",
+                    clip_id=claimed.clip_id,
+                    details=alert_details(self.config, claimed),
+                    subject=alert_subject(self.config, claimed.clip_id, outcome),
+                    title=original_title(claimed.manifest_path, claimed.caption),
+                )
+                setattr(error, "_clipper_alert_sent", True)
+
+        if failures and not results:
+            first_error = next(iter(failures.values()))
+            self._quarantine_failed_item(claimed, first_error)
+            raise first_error
+
+        publisher_dir = claimed.run_dir / "publisher"
+        publisher_dir.mkdir(parents=True, exist_ok=True)
+        (publisher_dir / "publish_state.json").write_text(
+            json.dumps({
+                "phase": "published",
+                "status": "partial" if failures else "success" if results else "skipped",
+                "result": results.get(INSTAGRAM) if len(results) == 1 and INSTAGRAM in results else results,
+                "errors": {name: str(error) for name, error in failures.items()},
+                "skipped": skipped,
+                "updated_at": datetime.now(ZoneInfo(self.config.timezone_name)).isoformat(),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        if results:
+            send_posted_alert(
+                clip_id=claimed.clip_id,
+                author_handle=claimed.author_handle,
+                results=results,
+                failures=failures,
+                details=alert_details(self.config, claimed),
+                subject=alert_subject(self.config, claimed.clip_id, "Partial" if failures else "Success"),
+                title=original_title(claimed.manifest_path, claimed.caption),
+            )
+            self._record_seen_id(claimed.clip_id)
+        self._archive_completed_item(claimed.run_dir)
+
     def process_one_ready_item(self, *, bypass_schedule: bool = False) -> bool:
         del bypass_schedule
         ready_items = []
@@ -192,48 +271,12 @@ class QueuePublisherRunner:
             return False
 
         item = ready_items[0]
+        # Read before claiming: claiming marks this slot done and the scheduler may overwrite the state afterwards.
+        platforms = read_slot_platforms(self.config.queue_dir)
         claimed = claim_item(self.config, item)
-        logger.info("Claimed ready queue item %s for publishing.", claimed.run_dir.name)
-        try:
-            publish_token = resolve_publish_access_token(self.config)
-            result = publish_to_instagram(self.config, claimed, access_token=publish_token)
-            publisher_dir = claimed.run_dir / "publisher"
-            publisher_dir.mkdir(parents=True, exist_ok=True)
-            (publisher_dir / "publish_state.json").write_text(
-                json.dumps({
-                    "phase": "published",
-                    "status": "success",
-                    "result": result,
-                    "updated_at": datetime.now(ZoneInfo(self.config.timezone_name)).isoformat(),
-                }, indent=2),
-                encoding="utf-8",
-            )
-            send_posted_alert(
-                clip_id=claimed.clip_id,
-                author_handle=claimed.author_handle,
-                publish_result=result if isinstance(result, dict) else {},
-                details=alert_details(self.config, claimed),
-                subject=alert_subject(self.config, claimed.clip_id, "Success"),
-                title=original_title(claimed.manifest_path, claimed.caption),
-            )
-            self._record_seen_id(claimed.clip_id)
-            logger.info("Instagram publish started for %s: %s", claimed.run_dir.name, result)
-            self._archive_completed_item(claimed.run_dir)
-            return True
-        except Exception as error:
-            logger.exception("Failed to publish queue item %s: %s", claimed.run_dir.name, error)
-            send_failure_alert(
-                app_name="ClipPublisher",
-                error=error,
-                context=f"publish failure for {claimed.run_dir.name}",
-                clip_id=claimed.clip_id,
-                details=alert_details(self.config, claimed),
-                subject=alert_subject(self.config, claimed.clip_id, "Fail"),
-                title=original_title(claimed.manifest_path, claimed.caption),
-            )
-            setattr(error, "_clipper_alert_sent", True)
-            self._quarantine_failed_item(claimed, error)
-            raise
+        logger.info("Claimed ready queue item %s for publishing to %s.", claimed.run_dir.name, ", ".join(platforms))
+        self._publish_claimed(claimed, platforms)
+        return True
 
     def run_forever(self) -> None:
         logger.info("ClipPublisher is watching %s for edited queue items.", self.config.queue_dir)
@@ -251,50 +294,14 @@ class QueuePublisherRunner:
                     continue
 
                 item = ready_items[0]
+                platforms = read_slot_platforms(self.config.queue_dir)
                 claimed = claim_item(self.config, item)
-                logger.info("Found ready queue item %s. Claiming and publishing immediately.", claimed.run_dir.name)
+                logger.info("Found ready queue item %s. Claiming and publishing to %s immediately.", claimed.run_dir.name, ", ".join(platforms))
                 try:
-                    publish_token = resolve_publish_access_token(self.config)
-                    publish_result = publish_to_instagram(self.config, claimed, access_token=publish_token)
-                    publisher_dir = claimed.run_dir / "publisher"
-                    publisher_dir.mkdir(parents=True, exist_ok=True)
-                    (publisher_dir / "publish_state.json").write_text(
-                        json.dumps({
-                            "phase": "published",
-                            "status": "success",
-                            "result": publish_result,
-                            "updated_at": datetime.now(ZoneInfo(self.config.timezone_name)).isoformat(),
-                        }, indent=2),
-                        encoding="utf-8",
-                    )
-                    send_posted_alert(
-                        clip_id=claimed.clip_id,
-                        author_handle=claimed.author_handle,
-                        publish_result=publish_result if isinstance(publish_result, dict) else {},
-                        details=alert_details(self.config, claimed),
-                        subject=alert_subject(self.config, claimed.clip_id, "Success"),
-                        title=original_title(claimed.manifest_path, claimed.caption),
-                    )
-                    logger.info("Instagram publish response for %s: %s", claimed.run_dir.name, publish_result)
-                except Exception as error:
-                    logger.exception("Instagram publish failed for %s: %s", claimed.run_dir.name, error)
-                    send_failure_alert(
-                        app_name="ClipPublisher",
-                        error=error,
-                        context=f"publish failure for {claimed.run_dir.name}",
-                        clip_id=claimed.clip_id,
-                        details=alert_details(self.config, claimed),
-                        subject=alert_subject(self.config, claimed.clip_id, "Fail"),
-                        title=original_title(claimed.manifest_path, claimed.caption),
-                    )
-                    setattr(error, "_clipper_alert_sent", True)
-                    self._quarantine_failed_item(claimed, error)
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                logger.info("Completed publishing %s.", claimed.run_dir.name)
-                self._record_seen_id(claimed.clip_id)
-                self._archive_completed_item(claimed.run_dir)
+                    self._publish_claimed(claimed, platforms)
+                    logger.info("Completed publishing %s.", claimed.run_dir.name)
+                except Exception:
+                    logger.error("Publishing %s failed on every platform; it was quarantined.", claimed.run_dir.name)
                 time.sleep(self.config.poll_interval_seconds)
             except KeyboardInterrupt:
                 logger.info("Shutting down ClipPublisher.")
