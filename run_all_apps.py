@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stop-after",
         choices=APPS,
-        help="Run one cycle immediately through this app without archiving the queue, then shut everything down.",
+        help="Archive existing queue items, run one fresh cycle through this app, then shut everything down.",
     )
     parser.add_argument(
         "--publish",
@@ -49,10 +49,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--test", action="store_true", help="Run everything inside <QUEUE_DIR>/Test, using its source folder instead of sourcing a new clip.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without launching.")
-    return parser.parse_args()
+    parser.add_argument("--schedule", action="store_true", help="Run start-of-day schedule creation (default: tomorrow 00:00) and exit without launching workers.")
+    parser.add_argument("--schedule-date", help="YYYY-MM-DD day to initialize with --schedule.")
+    args = parser.parse_args()
+    if args.schedule_date and not args.schedule:
+        parser.error("--schedule-date requires --schedule")
+    if args.schedule and (args.now or args.stop_after or args.test or args.publish):
+        parser.error("--schedule cannot be combined with --now, --stop-after, --test, or --publish")
+    return args
 
 
 def build_launch_plan(repo_root: Path, args: argparse.Namespace) -> list[tuple[str, Path, list[str]]]:
+    if getattr(args, "schedule", False):
+        flags = ["--schedule"] + ([f"--schedule-date={args.schedule_date}"] if getattr(args, "schedule_date", None) else [])
+        return [("ClipScheduler", repo_root / "apps" / "ClipScheduler", flags)]
     apps = APPS[: APPS.index(args.stop_after) + 1] if args.stop_after else APPS
     plan = []
     for app in apps:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import logging
+import os
 from pathlib import Path
 import sys
 
@@ -33,26 +35,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="Process one ready queue item and exit.")
     parser.add_argument("--refresh-token", action="store_true", help="Force-refresh and persist the long-lived Instagram token, then exit.")
     parser.add_argument("--youtube-auth", action="store_true", help="Run the one-time YouTube OAuth login for the active profile, then exit.")
-    return parser.parse_args()
+    profiles = parser.add_mutually_exclusive_group()
+    for path in sorted((APP_ROOT.parent.parent / "profiles").glob("*.env")):
+        if not path.stem.endswith(".local"):
+            profiles.add_argument(f"--{path.stem}", dest="profile", action="store_const", const=path.stem)
+    tokens = parser.add_mutually_exclusive_group()
+    tokens.add_argument("--token", help="Replacement Instagram token; requires --refresh-token. Prefer --token-prompt to avoid shell history.")
+    tokens.add_argument("--token-prompt", action="store_true", help="Read a replacement Instagram token using a hidden prompt.")
+    tokens.add_argument("--token-stdin", action="store_true", help="Read a replacement Instagram token from standard input (for automated rotation).")
+    args = parser.parse_args()
+    if (args.token is not None or args.token_prompt or args.token_stdin) and not args.refresh_token:
+        parser.error("--token, --token-prompt and --token-stdin require --refresh-token")
+    if args.refresh_token and (args.once or args.youtube_auth):
+        parser.error("--refresh-token cannot be combined with --once or --youtube-auth")
+    if args.token is not None and not args.token.strip():
+        parser.error("--token must not be empty")
+    return args
 
 
 def main() -> int:
     configure_logging()
     try:
         args = parse_args()
+        if args.profile:
+            os.environ["CLIPPER_PROFILE"] = args.profile
         repo_root = APP_ROOT
         config = AppConfig.from_repo_root(repo_root, resolve_media_url=not (args.refresh_token or args.youtube_auth))
-        runner = QueuePublisherRunner(config)
 
         if args.youtube_auth:
             run_youtube_auth(config)
             return 0
 
         if args.refresh_token:
-            resolved = resolve_publish_access_token(config, force_refresh=True)
-            logger.info("Token refresh complete. Active token suffix: ...%s", resolved[-8:] if len(resolved) >= 8 else resolved)
+            from clippublisher.token_manager import replace_access_token
+
+            if args.token_stdin:
+                replacement = sys.stdin.readline().strip()
+                if not replacement:
+                    raise ValueError("No token received on standard input.")
+            elif args.token_prompt:
+                replacement = getpass.getpass("New Instagram access token: ")
+            else:
+                replacement = args.token
+            if replacement is not None:
+                replace_access_token(config, replacement)
+            else:
+                resolve_publish_access_token(config, force_refresh=True)
+            logger.info("Token refresh complete for profile %s. Saved to %s.", os.environ.get("CLIPPER_PROFILE"), config.token_state_file)
             return 0
 
+        runner = QueuePublisherRunner(config)
         if args.once:
             runner.process_one_ready_item(bypass_schedule=True)
             return 0

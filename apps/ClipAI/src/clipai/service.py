@@ -6,7 +6,7 @@ import logging
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,6 +17,8 @@ from imageio_ffmpeg import get_ffmpeg_exe
 from common.alerts import send_failure_alert
 from common.platforms import YOUTUBE, read_slot_platforms
 from clipai.config import AppConfig
+from clipai import kick_placement
+from clipai.static_regions import StaticRegion, draw_candidates, draw_zoom_sheet, find_static_regions, union_box
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,9 @@ class GeminiRateLimitError(RuntimeError):
 
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 900
+WATERMARK_KINDS = ("watermark", "caption", "stream_overlay", "broadcast_graphic", "scene", "photo", "other")
+# Live-stream branding is part of the streamer's layout and must never be blurred as a source watermark.
+STREAM_BRANDING = re.compile(r"\b(kick|twitch)\b", re.IGNORECASE)
 
 
 class GeminiRetryableServiceError(RuntimeError):
@@ -141,9 +146,9 @@ class ClipAIService:
         template = self._read_prompt_template("overlay_detection.txt")
         return self._fill_prompt(template, {"CONTEXT": context or "No metadata provided."})
 
-    def _build_watermark_prompt(self, author_handle: str) -> str:
+    def _build_watermark_prompt(self, candidate_count: int) -> str:
         template = self._read_prompt_template("watermark_detection.txt")
-        return self._fill_prompt(template, {"AUTHOR": author_handle or "unknown"})
+        return self._fill_prompt(template, {"COUNT": str(candidate_count)})
 
     def _build_caption_prompt(self, context: str) -> str:
         template = self._read_prompt_template("caption_detection.txt")
@@ -196,6 +201,7 @@ class ClipAIService:
         audio_paths: list[Path] | None = None,
         model: str | None = None,
         plain_text: bool = False,
+        temperature: float = 0.2,
     ) -> dict[str, Any]:
         """Returns parsed JSON, or {"text": ...} when plain_text is set (free-form output keeps length and paragraphs)."""
         if not self.config.google_api_key:
@@ -219,7 +225,7 @@ class ClipAIService:
         payload: dict[str, Any] = {
             "contents": [{"parts": parts}],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": temperature,
                 "topP": 0.9,
             },
         }
@@ -321,7 +327,7 @@ class ClipAIService:
 
     def _normalize_caption_position(self, value: Any) -> str:
         normalized = str(value or "").strip().upper()
-        if normalized in {"TOP", "MIDDLE", "BOTTOM", "NONE"}:
+        if normalized in {"TOP", "MIDDLE", "BOTTOM", "BOTH", "NONE"}:
             return normalized
         return "NONE"
 
@@ -395,9 +401,17 @@ class ClipAIService:
             "properties": {
                 "has_caption": {"type": "BOOLEAN"},
                 "caption_position": {"type": "STRING"},
+                "text_bands": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {"top": {"type": "NUMBER"}, "bottom": {"type": "NUMBER"}},
+                        "required": ["top", "bottom"],
+                    },
+                },
                 "confidence": {"type": "NUMBER"},
             },
-            "required": ["has_caption", "caption_position", "confidence"],
+            "required": ["has_caption", "caption_position", "text_bands", "confidence"],
         }
         payload = self._call_gemini(self._build_caption_prompt(context), response_schema=schema, image_paths=image_paths)
         caption_position = self._normalize_caption_position(payload.get("caption_position"))
@@ -408,91 +422,123 @@ class ClipAIService:
             caption_position = "NONE"
         if not has_caption:
             caption_position = "NONE"
+        bands = self._normalize_text_bands(payload.get("text_bands")) if has_caption else []
+        if any(band["bottom"] <= 0.35 for band in bands) and any(band["top"] >= 0.65 for band in bands):
+            caption_position = "BOTH"
         return {
             "has_caption": has_caption,
             "caption_position": caption_position,
             "caption_confidence": confidence,
+            "caption_bands": bands,
         }
 
-    def _parse_watermark_box(self, value: Any) -> dict[str, float] | None:
-        """Convert Gemini's [ymin, xmin, ymax, xmax] (0-1000) into a normalized x/y/w/h box."""
-        if not isinstance(value, (list, tuple)) or len(value) != 4:
-            return None
-        try:
-            ymin, xmin, ymax, xmax = (max(0.0, min(1000.0, float(item))) / 1000.0 for item in value)
-        except (TypeError, ValueError):
-            return None
-        width, height = xmax - xmin, ymax - ymin
-        # A creator watermark is small; reject empty or implausibly large boxes.
-        if width <= 0.01 or height <= 0.005 or width * height > 0.15:
-            return None
-        return {"x": round(xmin, 4), "y": round(ymin, 4), "w": round(width, 4), "h": round(height, 4)}
+    def _normalize_text_bands(self, value: Any) -> list[dict[str, float]]:
+        """Vertical extents (0=top..1=bottom of the full frame) of overlaid text; implausible bands are dropped."""
+        bands: list[dict[str, float]] = []
+        for item in value if isinstance(value, list) else []:
+            try:
+                top, bottom = float(item["top"]), float(item["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if top > 1.0 or bottom > 1.0:
+                top, bottom = top / 100.0, bottom / 100.0
+            top, bottom = max(0.0, min(top, bottom)), min(1.0, max(top, bottom))
+            if 0.0 < bottom - top <= 0.4:
+                bands.append({"top": round(top, 4), "bottom": round(bottom, 4)})
+        return sorted(bands, key=lambda band: band["top"])
 
     def _detect_source_watermark(self, manifest: dict[str, Any], *, run_dir: Path | None = None) -> dict[str, Any]:
-        """Check a single frame for a burned-in creator watermark (moving watermarks are not handled)."""
+        """Measure the regions that never move, then let Gemini pick which (if any) is a watermark.
+
+        The box always comes from the measurement, never from AI coordinates. Anything unconfirmed means no blur.
+        """
+        del manifest
         none = {"has_source_watermark": False, "source_watermark_box": None, "source_watermark_confidence": 0.0}
         if run_dir is None:
             return none
         frame = run_dir / "ai" / "reference_frame_2.jpg"
-        if not frame.exists():
+        video = self._source_video_path(run_dir)
+        if not frame.exists() or video is None:
             return none
+        try:
+            regions = find_static_regions(video)
+            if not regions:
+                logger.info("No still regions found in %s; no source watermark blur.", run_dir.name)
+                return none
+            annotated = draw_candidates(frame, regions, run_dir / "ai" / "watermark_candidates.jpg")
+            zoomed = draw_zoom_sheet(frame, regions, run_dir / "ai" / "watermark_candidates_zoom.jpg")
+        except Exception:
+            logger.exception("Static-region scan failed for %s; no source watermark blur.", run_dir.name)
+            return none
+        logger.info(
+            "Still-region candidates for %s: %s",
+            run_dir.name,
+            "; ".join(f"#{index} {region.box()}" for index, region in enumerate(regions, start=1)),
+        )
         schema = {
             "type": "OBJECT",
             "properties": {
-                "has_watermark": {"type": "BOOLEAN"},
+                "boxes": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "number": {"type": "INTEGER"},
+                            "content": {"type": "STRING"},
+                            "kind": {"type": "STRING", "enum": list(WATERMARK_KINDS)},
+                        },
+                        "required": ["number", "content", "kind"],
+                        "propertyOrdering": ["number", "content", "kind"],
+                    },
+                },
                 "confidence": {"type": "NUMBER"},
-                "box_2d": {"type": "ARRAY", "items": {"type": "NUMBER"}},
             },
-            "required": ["has_watermark", "confidence"],
+            "required": ["boxes", "confidence"],
+            "propertyOrdering": ["boxes", "confidence"],
         }
-        author = str(manifest.get("author_handle") or "").strip()
         payload = self._call_gemini(
-            self._build_watermark_prompt(author),
+            self._build_watermark_prompt(len(regions)),
             response_schema=schema,
-            image_paths=[frame],
+            image_paths=[annotated, zoomed],
             model=self.config.watermark_model,
+            temperature=0.0,
         )
         confidence = self._normalize_confidence(payload.get("confidence"))
-        box = self._parse_watermark_box(payload.get("box_2d"))
-        if not bool(payload.get("has_watermark", False)) or confidence < 0.7 or box is None:
+        labels = payload.get("boxes") if isinstance(payload.get("boxes"), list) else []
+        logger.info(
+            "Watermark labels for %s: %s",
+            run_dir.name,
+            "; ".join(f"#{item.get('number')} {item.get('kind')}: {item.get('content')}" for item in labels if isinstance(item, dict)),
+        )
+        picked = [
+            item.get("number")
+            for item in labels
+            if isinstance(item, dict)
+            and item.get("kind") == "watermark"
+            and not STREAM_BRANDING.search(str(item.get("content") or ""))
+        ]
+        chosen = self._chosen_regions(picked, regions)
+        if not chosen or confidence < 0.7:
+            logger.info("No confirmed source watermark for %s (picked=%s, confidence=%.2f).", run_dir.name, picked, confidence)
             return {**none, "source_watermark_confidence": confidence}
-        box = self._refine_watermark_box(frame, box, schema, run_dir) or box
+        box = union_box(chosen)
+        if box["w"] * box["h"] > 0.15 or box["h"] > 0.15:
+            logger.info("Picked boxes for %s are too spread out (%s); no source watermark blur.", run_dir.name, box)
+            return {**none, "source_watermark_confidence": confidence}
+        logger.info("Confirmed source watermark for %s at %s (confidence %.2f).", run_dir.name, box, confidence)
         return {"has_source_watermark": True, "source_watermark_box": box, "source_watermark_confidence": confidence}
 
-    def _refine_watermark_box(self, frame: Path, box: dict[str, float], schema: dict[str, Any], run_dir: Path) -> dict[str, float] | None:
-        """Re-locate the watermark inside a zoomed crop around the first guess, since full-frame boxes can be vertically off."""
-        try:
-            from PIL import Image
-        except ImportError:
-            return None
-        try:
-            with Image.open(frame) as image:
-                width, height = image.size
-                pad_y = max(0.08, box["h"] * 2)
-                top = max(0.0, box["y"] - pad_y)
-                bottom = min(1.0, box["y"] + box["h"] + pad_y)
-                crop = image.crop((0, int(top * height), width, int(bottom * height)))
-                scale = max(1, round(1600 / max(1, crop.width)))
-                crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-                crop_path = run_dir / "ai" / "watermark_crop.png"
-                crop.save(crop_path)
-            prompt = self._read_prompt_template("watermark_crop.txt")
-            payload = self._call_gemini(prompt, response_schema=schema, image_paths=[crop_path], model=self.config.watermark_model)
-            local = self._parse_watermark_box(payload.get("box_2d"))
-            if local is None or not bool(payload.get("has_watermark", False)):
-                return None
-            span = bottom - top
-            # Keep the coarse horizontal extent (reliable); only the vertical position needs the zoomed pass.
-            center_y = top + (local["y"] + local["h"] / 2) * span
-            new_h = max(local["h"] * span, box["h"], 0.02)
-            return {
-                "x": round(min(box["x"], local["x"]), 4),
-                "y": round(max(0.0, center_y - new_h / 2), 4),
-                "w": round(max(box["x"] + box["w"], local["x"] + local["w"]) - min(box["x"], local["x"]), 4),
-                "h": round(new_h, 4),
-            }
-        except Exception:
-            return None
+    @staticmethod
+    def _chosen_regions(value: Any, regions: list[StaticRegion]) -> list[StaticRegion]:
+        chosen: list[StaticRegion] = []
+        for item in value if isinstance(value, list) else []:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= number <= len(regions) and regions[number - 1] not in chosen:
+                chosen.append(regions[number - 1])
+        return chosen
 
     def _analyze_visual(self, manifest: dict[str, Any], *, run_dir: Path | None = None) -> dict[str, Any]:
         overlay = self._detect_overlay_visual(manifest, run_dir=run_dir)
@@ -501,7 +547,110 @@ class ClipAIService:
         combined = dict(overlay)
         combined.update(caption)
         combined.update(watermark)
+        combined["kick_overlay_y"] = None
+        if not combined.get("has_kick_overlay"):
+            try:
+                combined["kick_overlay_y"] = self._pick_kick_overlay_y(run_dir, combined)
+            except Exception:
+                logger.exception("Kick overlay placement check failed; the editor will use its fallback position.")
         return combined
+
+    def _pick_kick_overlay_y(self, run_dir: Path | None, visual: dict[str, Any]) -> float | None:
+        """Gemini says which numbered strip positions (all inside the configured range) hide nothing important.
+
+        Returns the clear position nearest the configured spot as a fraction (y = (H - h) * fraction), or None
+        when nothing is confirmed clear, so the editor falls back to its own placement.
+        """
+        from PIL import Image
+
+        overlay_path = self.config.overlay_reference_image_path
+        frames = [run_dir / "ai" / f"reference_frame_{index}.jpg" for index in (1, 2, 3)] if run_dir else []
+        frames = [frame for frame in frames if frame.exists()]
+        if overlay_path is None or not frames:
+            return None
+        with Image.open(overlay_path) as overlay, Image.open(frames[0]) as frame:
+            strip_height = kick_placement.OUTPUT_WIDTH * overlay.height / overlay.width
+            layout = kick_placement.Layout(frame.width, frame.height, strip_height)
+        top_y, bottom_y = self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y
+        bands = visual.get("caption_bands") or []
+        caption_position = str(visual.get("caption_position") or "NONE")
+        # Same rule as the editor: the watermark uses its "top" setting when captions sit at the bottom.
+        keep_out = kick_placement.watermark_span(
+            layout,
+            box=visual.get("source_watermark_box") if visual.get("has_source_watermark") else None,
+            watermark_y=self.config.watermark_top_y if caption_position == "BOTTOM" else self.config.watermark_bottom_y,
+            size=self.config.watermark_size,
+            opacity=self.config.watermark_opacity,
+        )
+        fractions = kick_placement.candidate_fractions(layout, top_y, bottom_y, bands, [keep_out] if keep_out else [])
+        if not fractions:
+            logger.info("Every Kick overlay spot in range overlaps the account watermark for %s.", run_dir.name)
+            return None
+        sheet = kick_placement.draw_candidates(frames, layout, fractions, run_dir / "ai" / "kick_candidates.jpg")
+        prompt = self._fill_prompt(
+            self._read_prompt_template("kick_placement.txt"),
+            {"FRAME_COUNT": str(len(frames)), "CANDIDATE_COUNT": str(len(fractions))},
+        )
+        schema = {
+            "type": "OBJECT",
+            "properties": {
+                "boxes": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "number": {"type": "INTEGER"},
+                            "covers": {"type": "STRING"},
+                            "clear": {"type": "BOOLEAN"},
+                        },
+                        "required": ["number", "covers", "clear"],
+                        "propertyOrdering": ["number", "covers", "clear"],
+                    },
+                },
+                "confidence": {"type": "NUMBER"},
+            },
+            "required": ["boxes", "confidence"],
+            "propertyOrdering": ["boxes", "confidence"],
+        }
+        payload = self._call_gemini(
+            prompt, response_schema=schema, image_paths=[sheet], model=self.config.watermark_model, temperature=0.0
+        )
+        confidence = self._normalize_confidence(payload.get("confidence"))
+        labels = [item for item in payload.get("boxes") or [] if isinstance(item, dict)]
+        logger.info(
+            "Kick overlay spots for %s: %s",
+            run_dir.name,
+            "; ".join(
+                f"#{item.get('number')} ({self._fraction_label(fractions, item.get('number'))}) "
+                f"{'clear' if item.get('clear') is True else 'blocked'}: {item.get('covers')}"
+                for item in labels
+            ),
+        )
+        clear = []
+        for item in labels:
+            try:
+                number = int(item.get("number"))
+            except (TypeError, ValueError):
+                continue
+            if item.get("clear") is True and 1 <= number <= len(fractions):
+                clear.append(fractions[number - 1])
+        if not clear or confidence < 0.7:
+            logger.info(
+                "No confirmed clear Kick overlay spot for %s (clear=%s, confidence=%.2f); using the fallback position.",
+                run_dir.name, len(clear), confidence,
+            )
+            return None
+        target = kick_placement.default_fraction(top_y, bottom_y, caption_position)
+        chosen = round(min(clear, key=lambda fraction: abs(fraction - target)), 4)
+        logger.info("Kick overlay for %s placed at %.4f (configured spot %.4f).", run_dir.name, chosen, target)
+        return chosen
+
+    @staticmethod
+    def _fraction_label(fractions: list[float], number: Any) -> str:
+        try:
+            return f"{fractions[int(number) - 1]:.3f}"
+        except (TypeError, ValueError, IndexError):
+            return "?"
 
     def _extract_audio(self, video_path: Path, output_path: Path) -> Path | None:
         """Mono 16 kHz wav (about 2 MB/min); Gemini transcribes it at roughly 32 tokens per second of audio."""
@@ -624,6 +773,51 @@ class ClipAIService:
         )
         _write_json(path, state)
 
+    def backfill_youtube_metadata(self, *, since: date) -> int:
+        """Write missing YouTube metadata for archived, successfully published Instagram clips (no re-transcription)."""
+        written = 0
+        archive = self.config.queue_dir / "Archive"
+        if not archive.is_dir():
+            logger.info("No archive at %s; nothing to backfill.", archive)
+            return 0
+        for run_dir in sorted(path for path in archive.iterdir() if path.is_dir()):
+            publish = _read_json(run_dir / "publisher" / "publish_state.json")
+            if not isinstance(publish, dict) or publish.get("phase") != "published" or publish.get("status") not in {"success", "partial"}:
+                continue
+            published_raw = (publish.get("published_at") or {}).get("instagram") if isinstance(publish.get("published_at"), dict) else None
+            try:
+                published = datetime.fromisoformat(str(published_raw or publish.get("updated_at"))).astimezone(self._tz).date()
+            except ValueError:
+                continue
+            if published < since:
+                continue
+            editor_dir = run_dir / "editor"
+            if (editor_dir / "youtube_description.txt").exists():
+                continue
+            manifest_path = self._manifest_path(run_dir)
+            if manifest_path is None or not editor_dir.is_dir():
+                logger.warning("Backfill skipped %s: missing manifest or editor output.", run_dir.name)
+                continue
+            analysis = _read_json(self._analysis_path(run_dir))
+            analysis = analysis if isinstance(analysis, dict) else {}
+            manifest = _read_json(manifest_path)
+            transcript_path = run_dir / "ai" / "transcript.txt"
+            summary_path = self._summary_path(run_dir)
+            clip_context = {
+                "caption": self._summarize_context(manifest if isinstance(manifest, dict) else {}),
+                "transcript": transcript_path.read_text(encoding="utf-8").strip() if transcript_path.exists() else "",
+                "context_sufficient": bool(analysis.get("context_sufficient", False)),
+            }
+            fallback = str(analysis.get("summary") or "") or (summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else "")
+            (run_dir / "ai").mkdir(exist_ok=True)
+            description = self._write_youtube_files(run_dir, clip_context, fallback)
+            for name in ("youtube_title.txt", "youtube_description.txt"):
+                (editor_dir / name).write_text((run_dir / "ai" / name).read_text(encoding="utf-8").strip(), encoding="utf-8")
+            logger.info("Backfilled YouTube metadata for %s: %s", run_dir.name, " ".join(description.split())[:120])
+            written += 1
+        logger.info("YouTube metadata backfill complete: %s clip(s) updated in %s.", written, archive)
+        return written
+
     def process_once(self) -> bool:
         for run_dir in self._ready_items():
             state = self._load_state(run_dir)
@@ -640,6 +834,7 @@ class ClipAIService:
             has_kick_overlay = bool(visual.get("has_kick_overlay", False))
             has_caption = bool(visual.get("has_caption", False))
             caption_position = self._normalize_caption_position(visual.get("caption_position"))
+            caption_bands = self._normalize_text_bands(visual.get("caption_bands")) if has_caption else []
             has_source_watermark = bool(visual.get("has_source_watermark", False))
             source_watermark_box = visual.get("source_watermark_box") if has_source_watermark else None
             clip_context = self._analyze_clip_context(manifest, run_dir=run_dir)
@@ -648,13 +843,17 @@ class ClipAIService:
             hashtags = clip_context["hashtags"]
             (ai_dir / "transcript.txt").write_text(clip_context["transcript"], encoding="utf-8")
             platforms = read_slot_platforms(self.config.queue_dir)
+            # In instagram_top mode any Instagram post may be replayed to YouTube the next day.
+            needs_youtube = YOUTUBE in platforms or self.config.youtube_selection_mode == "instagram_top"
             youtube_description = (
-                self._write_youtube_files(run_dir, clip_context, summary) if YOUTUBE in platforms else None
+                self._write_youtube_files(run_dir, clip_context, summary) if needs_youtube else None
             )
             analysis = {
                 "has_kick_overlay": has_kick_overlay,
                 "has_caption": has_caption,
                 "caption_position": caption_position,
+                "caption_bands": caption_bands,
+                "kick_overlay_y": visual.get("kick_overlay_y") if not has_kick_overlay else None,
                 "has_source_watermark": has_source_watermark,
                 "source_watermark_box": source_watermark_box,
                 "context_sufficient": context_sufficient,

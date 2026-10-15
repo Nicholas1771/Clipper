@@ -115,10 +115,26 @@ class ClipEditorService:
             filters += f",unsharp=5:5:{sharpness:.3f}:5:5:0.0"
         return filters
 
-    def _probe_video_size(self, video_path: Path) -> tuple[int, int] | None:
+    def _probe_video_info(self, video_path: Path) -> tuple[tuple[int, int] | None, float | None]:
         completed = subprocess.run([str(get_ffmpeg_exe()), "-i", str(video_path)], capture_output=True, text=True)
-        match = re.search(r"Stream #.*Video:.*?[ ,](\d{2,5})x(\d{2,5})[ ,\[]", completed.stderr)
-        return (int(match.group(1)), int(match.group(2))) if match else None
+        size = None
+        duration = None
+        size_match = re.search(r"Stream #.*Video:.*?[ ,](\d{2,5})x(\d{2,5})[ ,\[]", completed.stderr)
+        if size_match:
+            size = (int(size_match.group(1)), int(size_match.group(2)))
+        dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
+        if dur_match:
+            hours, minutes, seconds = int(dur_match.group(1)), int(dur_match.group(2)), float(dur_match.group(3))
+            duration = hours * 3600 + minutes * 60 + seconds
+        return size, duration
+
+    def _probe_video_size(self, video_path: Path) -> tuple[int, int] | None:
+        size, _ = self._probe_video_info(video_path)
+        return size
+
+    def _probe_video_duration(self, video_path: Path) -> float | None:
+        _, duration = self._probe_video_info(video_path)
+        return duration
 
     def _plan_source_watermark_cover(
         self, video_path: Path, box: Any, *, target_width: int, target_height: int
@@ -135,11 +151,13 @@ class ClipEditorService:
             bx, by, bw, bh = (float(box[key]) for key in ("x", "y", "w", "h"))
         except (KeyError, TypeError, ValueError):
             return None
-        pad_x, pad_y = bw * 0.15, bh * 0.25
-        left = max(2, int((bx - pad_x) * source_width))
-        top = max(2, int((by - pad_y) * source_height))
-        right = min(source_width - 2, int((bx + bw + pad_x) * source_width))
-        bottom = min(source_height - 2, int((by + bh + pad_y) * source_height))
+        # The box is measured from the video and already includes a few pixels of slack; only a hairline
+        # margin is added so delogo samples its border colours from outside the watermark's soft edges.
+        margin = 3
+        left = max(2, int(bx * source_width) - margin)
+        top = max(2, int(by * source_height) - margin)
+        right = min(source_width - 2, int((bx + bw) * source_width) + margin)
+        bottom = min(source_height - 2, int((by + bh) * source_height) + margin)
         if right - left < 4 or bottom - top < 4:
             return None
         scale = min(target_width / source_width, target_height / source_height)
@@ -152,17 +170,122 @@ class ClipEditorService:
         width, height = right - left, bottom - top
         return f"delogo=x={left}:y={top}:w={width}:h={height}", center
 
+    def _kick_overlay_y(
+        self,
+        source_video: Path,
+        overlay_position: str,
+        caption_bands: Any,
+        *,
+        target_width: int,
+        target_height: int,
+        caption_position: str = "",
+        ai_fraction: Any = None,
+        watermark_box: dict[str, Any] | None = None,
+    ) -> str:
+        """Overlay y expression, always between KICK_OVERLAY_TOP_Y and KICK_OVERLAY_BOTTOM_Y and clear of our watermark.
+
+        Order: ClipAI's confirmed clear spot; otherwise the target spot (middle of the range when captions sit at
+        top and bottom, else the configured top/bottom spot) moved to the nearest place clear of the caption text
+        bands; otherwise the nearest place clear of the watermark only; otherwise the target spot.
+        """
+        low = min(self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y)
+        high = max(self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y)
+        if caption_position == "BOTH":
+            target = (low + high) / 2
+        else:
+            target = self.config.kick_overlay_top_y if overlay_position == "top" else self.config.kick_overlay_bottom_y
+        target_expr = f"(H-h)*{target:.4f}"
+        ai_pick = None
+        if isinstance(ai_fraction, (int, float)) and not isinstance(ai_fraction, bool):
+            ai_pick = max(low, min(high, float(ai_fraction)))
+
+        source_size = self._probe_video_size(source_video)
+        overlay_size = self._probe_video_size(self.config.overlay_image_path)
+        if source_size is None or overlay_size is None:
+            return f"(H-h)*{ai_pick:.4f}" if ai_pick is not None else target_expr
+        overlay_height = target_width * overlay_size[1] / overlay_size[0]
+        scale = min(target_width / source_size[0], target_height / source_size[1])
+        offset_y = (target_height - source_size[1] * scale) / 2
+        max_y = target_height - overlay_height
+        if max_y <= 0:
+            return target_expr
+
+        def to_output(fraction: float) -> float:
+            return offset_y + fraction * source_size[1] * scale
+
+        keep_out = self._watermark_rows(overlay_position, watermark_box, to_output, target_height)
+        # Gemini's band edges are approximate, so keep a clear safety gap around each text block.
+        margin = 0.025 * target_height
+        text_rows: list[tuple[float, float]] = []
+        bands = caption_bands if isinstance(caption_bands, list) else []
+        for band in bands:
+            try:
+                text_rows.append((to_output(float(band["top"])) - margin, to_output(float(band["bottom"])) + margin))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        def clear_of(y: float, rows: list[tuple[float, float]]) -> bool:
+            return max_y * low - 0.01 <= y <= max_y * high + 0.01 and all(
+                y + overlay_height <= top or y >= bottom for top, bottom in rows
+            )
+
+        def nearest(goal: float, rows: list[tuple[float, float]]) -> float | None:
+            options = [goal * max_y, max_y * low, max_y * high]
+            options += [edge for top, bottom in rows for edge in (top - overlay_height, bottom)]
+            clear = [y for y in options if clear_of(y, rows)]
+            return min(clear, key=lambda y: abs(y - goal * max_y)) / max_y if clear else None
+
+        if ai_pick is not None and clear_of(ai_pick * max_y, keep_out):
+            logger.info("Placing the Kick overlay at ClipAI's clear spot %.4f.", ai_pick)
+            return f"(H-h)*{ai_pick:.4f}"
+        chosen = nearest(target, keep_out + text_rows)
+        if chosen is None:
+            chosen = nearest(target, keep_out)
+        if chosen is None:
+            logger.info("No spot in range is clear of the watermark and captions; using the configured Kick position.")
+            return target_expr
+        if abs(chosen - target) * max_y > 0.5:
+            logger.info("Moved the Kick overlay from %.4f to %.4f to avoid captions and the watermark.", target, chosen)
+        elif caption_position == "BOTH":
+            logger.info("Captions at top and bottom; placing the Kick overlay in the middle (%.4f).", target)
+        return f"(H-h)*{chosen:.4f}"
+
+    def _watermark_rows(
+        self, overlay_position: str, watermark_box: dict[str, Any] | None, to_output: Any, target_height: int
+    ) -> list[tuple[float, float]]:
+        """Output rows used by our account watermark (and the blurred source watermark it sits on)."""
+        font_size = round(self.config.watermark_size * target_height)
+        has_text = self.config.watermark_opacity > 0 and font_size >= 1
+        margin = 0.01 * target_height
+        if isinstance(watermark_box, dict):
+            try:
+                top = to_output(float(watermark_box["y"]))
+                bottom = to_output(float(watermark_box["y"]) + float(watermark_box["h"]))
+            except (KeyError, TypeError, ValueError):
+                top = bottom = None
+            if top is not None:
+                center = (top + bottom) / 2
+                if has_text:
+                    top, bottom = min(top, center - font_size / 2), max(bottom, center + font_size / 2)
+                return [(top - margin, bottom + margin)]
+        if not has_text:
+            return []
+        watermark_y = self.config.watermark_top_y if overlay_position == "top" else self.config.watermark_bottom_y
+        y = (target_height - font_size) * watermark_y
+        return [(y - margin, y + font_size + margin)]
+
     def _watermark_filter(
         self,
         input_label: str,
         overlay_position: str = "bottom",
         anchor: tuple[float, float] | None = None,
+        output_label: str = "outv",
     ) -> str:
         """Drawtext for the watermark. Y: 0=top..1=bottom (separate values for the top/bottom Kick overlay placement), opacity: 0..1, size: fraction of frame height."""
         opacity = self.config.watermark_opacity
         font_size = round(self.config.watermark_size * 1920)
         if opacity <= 0 or font_size < 1:
-            return f"[{input_label}]null[outv]"
+            return f"[{input_label}]null[{output_label}]"
         watermark_y = self.config.watermark_top_y if overlay_position == "top" else self.config.watermark_bottom_y
         if anchor is not None:
             # Sit on top of the blurred source watermark, kept inside the frame.
@@ -177,7 +300,7 @@ class ClipEditorService:
             f"[{input_label}]drawtext=text='{self.config.watermark_text}':{self._drawtext_font_argument()}:"
             f"fontcolor=white@{opacity:.3f}:fontsize={font_size}:"
             f"x='{x_expr}':y='{y_expr}':"
-            f"shadowcolor=black@{shadow_alpha:.3f}:shadowx=1:shadowy=1:bordercolor=black@{border_alpha:.3f}:borderw=1[outv]"
+            f"shadowcolor=black@{shadow_alpha:.3f}:shadowx=1:shadowy=1:bordercolor=black@{border_alpha:.3f}:borderw=1[{output_label}]"
         )
 
     def _render_edited_video(
@@ -188,6 +311,9 @@ class ClipEditorService:
         add_kick_overlay: bool = True,
         overlay_position: str = "bottom",
         source_watermark_box: dict[str, Any] | None = None,
+        caption_bands: Any = None,
+        caption_position: str = "",
+        kick_overlay_fraction: Any = None,
     ) -> None:
         ffmpeg_exe = str(get_ffmpeg_exe())
         target_width = 1080
@@ -205,15 +331,22 @@ class ClipEditorService:
         if add_kick_overlay:
             if not self.config.overlay_image_path.exists():
                 raise FileNotFoundError(f"Overlay image does not exist: {self.config.overlay_image_path}")
-            overlay_fraction = (
-                self.config.kick_overlay_top_y if overlay_position == "top" else self.config.kick_overlay_bottom_y
+            overlay_y = self._kick_overlay_y(
+                source_video,
+                overlay_position,
+                caption_bands,
+                target_width=target_width,
+                target_height=target_height,
+                caption_position=caption_position,
+                ai_fraction=kick_overlay_fraction,
+                watermark_box=source_watermark_box if watermark_anchor is not None else None,
             )
-            overlay_y = f"(H-h)*{overlay_fraction:.4f}"
+            # The Kick strip goes on last so it is always the top layer.
             filter_complex = (
                 f"[0:v]{source_cover}scale={target_width}:{target_height}:force_original_aspect_ratio=decrease{source_enhance},pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[base];"
-                f"[1:v]scale={target_width}:-1,setsar=1[logo];"
-                f"[base][logo]overlay=x=(W-w)/2:y='{overlay_y}':format=auto[withlogo];"
-                + self._watermark_filter("withlogo", overlay_position, watermark_anchor)
+                + self._watermark_filter("base", overlay_position, watermark_anchor, output_label="marked")
+                + f";[1:v]scale={target_width}:-1,setsar=1[logo];"
+                f"[marked][logo]overlay=x=(W-w)/2:y='{overlay_y}':format=auto[outv]"
             )
             input_images = [
                 "-i",
@@ -233,21 +366,50 @@ class ClipEditorService:
                 "-map",
                 "[outv]",
             ]
+
+        trim_start = max(0.0, self.config.trim_start_seconds)
+        trim_end = max(0.0, self.config.trim_end_seconds)
+        trim_args: list[str] = []
+        if trim_start > 0 or trim_end > 0:
+            source_duration = self._probe_video_duration(source_video)
+            if source_duration is not None:
+                if source_duration > (trim_start + trim_end):
+                    target_duration = source_duration - trim_start - trim_end
+                    if trim_start > 0:
+                        trim_args.extend(["-ss", f"{trim_start:.3f}"])
+                    trim_args.extend(["-t", f"{target_duration:.3f}"])
+                else:
+                    logger.warning(
+                        "Video duration (%.2fs) shorter than requested trims (start=%.2fs, end=%.2fs); skipping trim.",
+                        source_duration,
+                        trim_start,
+                        trim_end,
+                    )
+            elif trim_start > 0:
+                trim_args.extend(["-ss", f"{trim_start:.3f}"])
+
         command = [
             ffmpeg_exe,
             "-y",
+        ]
+        command.extend(trim_args)
+        command.extend([
             "-i",
             str(source_video),
-        ]
+        ])
         command.extend(input_images)
         command.extend([
             "-filter_complex",
             filter_complex,
         ])
+        audio_args: list[str] = ["-map", "0:a?"]
+        pitch = self.config.audio_pitch_scale
+        if abs(pitch - 1.0) > 1e-4:
+            audio_args.extend(["-af", f"rubberband=pitch={pitch:.4f}"])
+
         command.extend(output_map)
+        command.extend(audio_args)
         command.extend([
-            "-map",
-            "0:a?",
             "-c:v",
             "libx264",
             "-preset",
@@ -347,6 +509,9 @@ class ClipEditorService:
                 add_kick_overlay=add_kick_overlay,
                 overlay_position=overlay_position,
                 source_watermark_box=ai_state.get("source_watermark_box") if ai_state.get("has_source_watermark") else None,
+                caption_bands=ai_state.get("caption_bands") if has_caption else None,
+                caption_position=caption_position if has_caption else "",
+                kick_overlay_fraction=ai_state.get("kick_overlay_y"),
             )
             self._write_metadata_files(run_dir, manifest)
             self._mark_edited(run_dir, edited_path)

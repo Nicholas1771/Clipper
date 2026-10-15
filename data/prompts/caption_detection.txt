@@ -6,10 +6,14 @@ NOT within individual split-screen video feeds or webcam boxes.
 A caption resting in the vertical center or dividing two split-screen feeds is strictly MIDDLE.
 
 Rules:
-- Classify caption_position as TOP, MIDDLE, BOTTOM, or NONE.
+- Classify caption_position as TOP, MIDDLE, BOTTOM, BOTH, or NONE. Use BOTH when there is caption/title text near the top AND subtitle/caption text near the bottom.
 - Set has_caption=true only when overlaid caption text is clearly visible.
 - Classify the position of the MAIN subtitle/caption text that appears across most frames.
 - Ignore small watermarks, usernames, channel-names or logo text.
-- Return only JSON with schema {"has_caption": boolean, "caption_position": "TOP|MIDDLE|BOTTOM|NONE", "confidence": number}.
+- text_bands: list EVERY block of overlaid caption/title/subtitle text (for example a title at the top AND subtitles at the bottom).
+  For each block give "top" and "bottom" as fractions of the full image height (0.0 = top edge, 1.0 = bottom edge).
+  If the text moves or changes between frames, cover the full vertical range it occupies across all frames, including every line of multi-line text.
+  Do not include watermarks, usernames, logos, or Kick/Twitch stream branding bars. Use [] when there is no caption.
+- Return only JSON with schema {"has_caption": boolean, "caption_position": "TOP|MIDDLE|BOTTOM|BOTH|NONE", "text_bands": [{"top": number, "bottom": number}], "confidence": number}.
 
 Available details: __CONTEXT__

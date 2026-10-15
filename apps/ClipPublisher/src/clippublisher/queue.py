@@ -55,6 +55,42 @@ def _ready_manifest_path(run_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def build_queue_item(run_dir: Path, *, use_ai_summary: bool = False) -> QueueItem | None:
+    """Build a QueueItem (manifest, video and publish metadata) for a run directory, whatever its phase."""
+    manifest_path = _ready_manifest_path(run_dir)
+    video_path = _ready_video_path(run_dir)
+    if manifest_path is None or video_path is None:
+        return None
+
+    data = _read_manifest(manifest_path)
+    clip_id = str(data.get("clip_id") or run_dir.name)
+    author_handle = str(data.get("author_handle") or "unknown")
+    text = str(data.get("text") or "")
+    caption = text.strip() or f"{author_handle} clip"
+    caption_file = run_dir / "editor" / "caption.txt"
+    if caption_file.exists():
+        caption = caption_file.read_text(encoding="utf-8").strip() or caption
+    description = ""
+    description_file = run_dir / "editor" / "description.txt"
+    if description_file.exists():
+        description = description_file.read_text(encoding="utf-8").strip()
+    if use_ai_summary and not description:
+        description = _read_text(run_dir / "ai" / "summary.txt")
+    youtube_title = _read_text(run_dir / "editor" / "youtube_title.txt")
+    youtube_description = _read_text(run_dir / "editor" / "youtube_description.txt")
+    return QueueItem(
+        run_dir=run_dir,
+        manifest_path=manifest_path,
+        video_path=video_path,
+        clip_id=clip_id,
+        caption=caption,
+        author_handle=author_handle,
+        description=description,
+        youtube_title=youtube_title,
+        youtube_description=youtube_description,
+    )
+
+
 def discover_queue_items(config: AppConfig) -> list[QueueItem]:
     config.queue_dir.mkdir(parents=True, exist_ok=True)
 
@@ -69,41 +105,12 @@ def discover_queue_items(config: AppConfig) -> list[QueueItem]:
         if state and state.get("phase") != "edited":
             continue
 
-        manifest_path = _ready_manifest_path(child)
-        video_path = _ready_video_path(child)
-        if manifest_path is None or video_path is None:
-            continue
-
         if state.get("phase") == "edited" and not (child / "editor").exists():
             continue
 
-        data = _read_manifest(manifest_path)
-        clip_id = str(data.get("clip_id") or child.name)
-        author_handle = str(data.get("author_handle") or "unknown")
-        text = str(data.get("text") or "")
-        caption = text.strip() or f"{author_handle} clip"
-        caption_file = child / "editor" / "caption.txt"
-        if caption_file.exists():
-            caption = caption_file.read_text(encoding="utf-8").strip() or caption
-        description = ""
-        description_file = child / "editor" / "description.txt"
-        if description_file.exists():
-            description = description_file.read_text(encoding="utf-8").strip()
-        youtube_title = _read_text(child / "editor" / "youtube_title.txt")
-        youtube_description = _read_text(child / "editor" / "youtube_description.txt")
-        items.append(
-            QueueItem(
-                run_dir=child,
-                manifest_path=manifest_path,
-                video_path=video_path,
-                clip_id=clip_id,
-                caption=caption,
-                author_handle=author_handle,
-                description=description,
-                youtube_title=youtube_title,
-                youtube_description=youtube_description,
-            )
-        )
+        item = build_queue_item(child)
+        if item is not None:
+            items.append(item)
     return items
 
 

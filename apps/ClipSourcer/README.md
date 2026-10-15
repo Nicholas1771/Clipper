@@ -44,6 +44,7 @@ I chose **TikTok** as the default source because Instagram's official hashtag ac
 | `STATE_FILE` | sourced-ID state file | `data/state.json` |
 | `SOURCE_HISTORY_FILE` | daily sourcing history file | `data/source_history.json` |
 | `SOURCE_SCHEDULE_FILE` | persisted randomized schedule for the current sourcing day | `data/source_schedule.json` |
+| `CANDIDATE_CACHE_FILE` | persistent cache of eligible, unused Apify results | `data/candidate_cache.json` |
 | `APIFY_ACTOR_ID` | Apify actor slug for TikTok sourcing | `clockworks~tiktok-scraper` |
 | `DOWNLOAD_VIDEO_FILES` | request and download raw video files when the clip author is authorized | `false` |
 | `AUTHORIZED_DOWNLOAD_PROFILES` | comma-separated TikTok handles allowed for video download | empty |
@@ -77,6 +78,14 @@ Each attempt is validated, and any partial file is deleted before the next fallb
 ## Cost note
 
 Apify's TikTok Scraper docs show `resultsPerPage`, hashtags, profiles, search, download toggles, and popularity filters based on likes, but **not a server-side minimum view filter**. So `MINIMUM_VIEW_COUNT` helps the app ignore low-view clips locally, but it does **not** reduce Apify billing by itself. The main cost levers are keeping `RESULTS_PER_PAGE` low and using narrower sources such as owned profiles instead of broad hashtag pulls. The fallback downloader also keeps Apify as the last resort so a successful `yt-dlp` or TikWM download avoids Apify's paid video-download add-on.
+
+Each sourcing attempt logs the returned results' view-count distribution in ranges from `<1,000` through `>=10,000,000`, before applying the app's local eligibility filters. It also logs one diagnostic line per clip with its ID, author, engagement counts, view count, viral score, eligibility and selection ranks, filter outcomes, seen status, rejection reasons, URL, and caption snippet.
+
+Eligible, unused results are persisted in `CANDIDATE_CACHE_FILE` and reused before making another Apify request. Cached clips are rechecked against the current lookback, keyword, and minimum-view filters. Before processing a selected clip, it is removed from the cache and reserved in a separate `<cache-stem>_attempted.json` file alongside the cache. Attempted clips are excluded from future selection, including after restarts or failures in download, AI, editing, or publishing. Only a successful publish to at least one assigned platform adds a clip to `seen_ids`; caching, queueing, and failed publishes do not. The cache is scoped to the actor and configured source, so changing the hashtag/profile or actor causes a fresh fetch.
+
+After saving a fresh Apify batch to the cache, an INFO line identifies each saved clip by ID, author, views, current viral score, post date, and URL. When attempting a cached clip, an INFO line logs those same details as `Using candidate from cache`. Removing the selected clip logs only the remaining cache size, not misleading per-item save messages. Full per-result selection diagnostics are DEBUG-level logs.
+
+Each sourcing attempt logs the unseen, unexpired cache size and whether candidates come from the cache or a new Apify request. Successful cache saves also log the resulting cache size, including zero when exhausted.
 
 ## Usage
 

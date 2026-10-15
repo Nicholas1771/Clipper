@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from common.env import load_app_env, looks_like_windows_path, resolve_asset_path
+from common.env import load_app_env, looks_like_windows_path, read_dotenv, resolve_asset_path
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,13 @@ class AppConfig:
     watermark_model: str = "gemini-2.5-flash"
     context_model: str = "gemini-2.5-flash"
     streamer_name: str = ""
-
+    youtube_selection_mode: str = "shared"
+    kick_overlay_top_y: float = 0.26
+    kick_overlay_bottom_y: float = 0.74
+    watermark_top_y: float = 0.5
+    watermark_bottom_y: float = 0.5
+    watermark_size: float = 0.02
+    watermark_opacity: float = 0.42
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
         root_dir = load_app_env(repo_root)
@@ -49,4 +55,28 @@ class AppConfig:
             watermark_model=os.getenv("WATERMARK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             streamer_name=os.getenv("STREAMER_NAME", "").strip(),
             context_model=os.getenv("CONTEXT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
+            youtube_selection_mode=os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip().lower() or "shared",
+            **_placement_settings(root_dir),
         )
+
+
+def _placement_settings(root_dir: Path) -> dict[str, float]:
+    """Kick strip and watermark placement, read the same way ClipEditor reads them (its .env backs up the process env)."""
+    editor_env = read_dotenv(root_dir / "apps" / "ClipEditor" / ".env")
+
+    def value(name: str, default: float) -> float:
+        raw = os.getenv(name, "").strip() or str(editor_env.get(name, "")).strip()
+        try:
+            return max(0.0, min(1.0, float(raw))) if raw else default
+        except ValueError:
+            return default
+
+    watermark_y = value("WATERMARK_Y", 0.5)
+    return {
+        "kick_overlay_top_y": value("KICK_OVERLAY_TOP_Y", 0.26),
+        "kick_overlay_bottom_y": value("KICK_OVERLAY_BOTTOM_Y", 0.74),
+        "watermark_top_y": value("WATERMARK_TOP_Y", watermark_y),
+        "watermark_bottom_y": value("WATERMARK_BOTTOM_Y", watermark_y),
+        "watermark_size": value("WATERMARK_SIZE", 0.02),
+        "watermark_opacity": value("WATERMARK_OPACITY", 0.42),
+    }

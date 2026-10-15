@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -16,11 +17,95 @@ from clipsourcer.apify_client import fetch_tiktok_items
 from clipsourcer.config import AppConfig
 from clipsourcer.downloads import download_video_file
 from clipsourcer.models import ClipCandidate
-from clipsourcer.scoring import rank_candidates
-from clipsourcer.storage import load_seen_ids, run_timestamp, unique_run_dir, read_queue_state, save_seen_ids, write_manifest, write_queue_state
+from clipsourcer.scoring import has_minimum_views, is_recent, matches_keyword, rank_candidates, viral_score
+from clipsourcer.storage import load_seen_ids, run_timestamp, unique_run_dir, read_queue_state, write_manifest, write_queue_state
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_play_count_distribution(candidates: list[ClipCandidate]) -> None:
+    buckets = (
+        "<1,000",
+        "1,000-9,999",
+        "10,000-99,999",
+        "100,000-999,999",
+        "1,000,000-9,999,999",
+        ">=10,000,000",
+    )
+    thresholds = (1_000, 10_000, 100_000, 1_000_000, 10_000_000)
+    counts = [0] * len(buckets)
+    for candidate in candidates:
+        bucket_index = next(
+            (index for index, threshold in enumerate(thresholds) if candidate.plays < threshold),
+            len(thresholds),
+        )
+        counts[bucket_index] += 1
+
+    distribution = ", ".join(f"{label}: {count}" for label, count in zip(buckets, counts))
+    logger.info("Apify result play-count distribution (total=%s): %s", len(candidates), distribution)
+
+
+def _log_candidate_diagnostics(
+    candidates: list[ClipCandidate],
+    *,
+    origin: str,
+    now: datetime,
+    lookback_hours: int,
+    keyword: str,
+    minimum_view_count: int,
+    seen_ids: set[str],
+    ranked: list[tuple[ClipCandidate, float]],
+    unseen_ranked: list[tuple[ClipCandidate, float]],
+) -> None:
+    eligible_positions = {candidate.clip_id: index for index, (candidate, _) in enumerate(ranked, start=1)}
+    selection_positions = {
+        candidate.clip_id: index for index, (candidate, _) in enumerate(unseen_ranked, start=1)
+    }
+
+    for candidate in candidates:
+        recent = is_recent(candidate, now, lookback_hours)
+        keyword_match = matches_keyword(candidate, keyword)
+        meets_minimum_views = has_minimum_views(candidate, minimum_view_count)
+        seen = candidate.clip_id in seen_ids
+        rejected_by = [
+            reason
+            for condition, reason in (
+                (not recent, "outside_lookback"),
+                (not keyword_match, "keyword_mismatch"),
+                (not meets_minimum_views, "below_min_views"),
+                (seen, "already_seen"),
+            )
+            if condition
+        ]
+        text = " ".join(candidate.text.split())[:120]
+        logger.debug(
+            "%s candidate: id=%s author=%s views=%s likes=%s comments=%s shares=%s saves=%s "
+            "posted=%s age_hours=%.2f viral_score=%.2f eligible_rank=%s selection_rank=%s "
+            "recent=%s keyword_match=%s meets_min_views=%s (minimum=%s) seen=%s "
+            "rejected_by=%s url=%s text=%r",
+            origin,
+            candidate.clip_id,
+            candidate.author_handle or "unknown",
+            candidate.plays,
+            candidate.likes,
+            candidate.comments,
+            candidate.shares,
+            candidate.saves,
+            candidate.created_at.isoformat(),
+            (now - candidate.created_at).total_seconds() / 3600,
+            viral_score(candidate, now),
+            eligible_positions.get(candidate.clip_id, "-"),
+            selection_positions.get(candidate.clip_id, "-"),
+            recent,
+            keyword_match,
+            meets_minimum_views,
+            minimum_view_count,
+            seen,
+            ",".join(rejected_by) or "none",
+            candidate.url,
+            text,
+        )
 
 
 @dataclass(frozen=True)
@@ -65,6 +150,118 @@ class ClipSourcerService:
 
     def _local_now(self) -> datetime:
         return datetime.now(self._tz)
+
+    def _attempted_candidates_path(self) -> Path:
+        cache_path = self.config.candidate_cache_file
+        return cache_path.with_name(f"{cache_path.stem}_attempted.json")
+
+    def _load_attempted_candidates(self) -> set[str]:
+        path = self._attempted_candidates_path()
+        if not path.exists():
+            return set()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("attempted_ids"), list):
+            raise ValueError(f"Invalid attempted-candidate history: {path}")
+        return set(payload["attempted_ids"])
+
+    def _reserve_candidate(self, clip_id: str, attempted_ids: set[str]) -> None:
+        path = self._attempted_candidates_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f"{path.name}.tmp")
+        temporary_path.write_text(
+            json.dumps({"attempted_ids": sorted(attempted_ids | {clip_id})}, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+        attempted_ids.add(clip_id)
+
+    def _candidate_cache_scope(self) -> str:
+        source_target = (
+            self.config.source_hashtag
+            if self.config.source_mode == "hashtag"
+            else sorted(self.config.source_profiles)
+        )
+        scope = json.dumps(
+            {
+                "actor": self.config.apify_actor_id,
+                "mode": self.config.source_mode,
+                "target": source_target,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+    def _load_candidate_cache(self, seen_ids: set[str], now: datetime) -> list[ClipCandidate]:
+        cache_path = self.config.candidate_cache_file
+        if not cache_path.exists():
+            return []
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            logger.warning("Could not read candidate cache %s; fetching fresh results: %s", cache_path, error)
+            return []
+        if not isinstance(payload, dict) or payload.get("scope") != self._candidate_cache_scope():
+            logger.info("Candidate cache is absent or belongs to a different source; fetching fresh results.")
+            return []
+
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            logger.warning("Candidate cache %s has no valid items list; fetching fresh results.", cache_path)
+            return []
+
+        candidates: list[ClipCandidate] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                logger.warning("Ignoring malformed item in candidate cache %s.", cache_path)
+                continue
+            try:
+                candidate = ClipCandidate.from_apify_item(item)
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
+                logger.warning("Ignoring invalid cached candidate in %s: %s", cache_path, error)
+                continue
+            if candidate.clip_id in seen_ids or not is_recent(candidate, now, self.config.lookback_hours):
+                continue
+            candidates.append(candidate)
+        return candidates
+
+    def _save_candidate_cache(
+        self, candidates: list[ClipCandidate], *, log_candidates: bool = True, required: bool = False
+    ) -> None:
+        cache_path = self.config.candidate_cache_file
+        temporary_path = cache_path.with_name(f"{cache_path.name}.tmp")
+        payload = {
+            "scope": self._candidate_cache_scope(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "items": [candidate.raw_payload for candidate in candidates],
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            temporary_path.replace(cache_path)
+        except OSError as error:
+            logger.warning("Could not persist candidate cache %s: %s", cache_path, error)
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logger.warning("Could not remove temporary candidate cache %s: %s", temporary_path, cleanup_error)
+            if required:
+                raise
+        else:
+            logger.info("Candidate cache saved: size=%s clip(s).", len(candidates))
+            if not log_candidates:
+                return
+            now = datetime.now(timezone.utc)
+            for candidate in candidates:
+                logger.info(
+                    "Saved candidate to cache: id=%s author=%s views=%s viral_score=%.2f posted=%s url=%s",
+                    candidate.clip_id,
+                    candidate.author_handle or "unknown",
+                    candidate.plays,
+                    viral_score(candidate, now),
+                    candidate.created_at.isoformat(),
+                    candidate.url,
+                )
 
     def _scheduler_ready(self) -> bool:
         state_path = self.config.output_dir / "scheduler_state.json"
@@ -250,9 +447,26 @@ class ClipSourcerService:
         )
         seen_ids = load_seen_ids(self.config.state_file)
         logger.info("Loaded %s previously sourced clip ID%s.", len(seen_ids), "" if len(seen_ids) == 1 else "s")
-        raw_items = self.fetch_items(self.config)
-        candidates = [ClipCandidate.from_apify_item(item) for item in raw_items]
+        attempted_ids = self._load_attempted_candidates()
+        excluded_ids = seen_ids | attempted_ids
+        logger.info("Loaded %s previously attempted candidate IDs (separate from published seen history).", len(attempted_ids))
         now_utc = datetime.now(timezone.utc)
+        candidates = self._load_candidate_cache(excluded_ids, now_utc)
+        logger.info("Candidate cache size at sourcing start: %s unseen, unexpired clip(s).", len(candidates))
+        origin = "Cached"
+        if candidates:
+            logger.info(
+                "Using %s candidate%s from the persistent cache; skipping Apify fetch.",
+                len(candidates),
+                "" if len(candidates) == 1 else "s",
+            )
+        else:
+            logger.info("Candidate source: Apify; fetching new results because the cache is empty or unavailable.")
+            raw_items = self.fetch_items(self.config)
+            candidates = [ClipCandidate.from_apify_item(item) for item in raw_items]
+            origin = "Apify"
+            _log_play_count_distribution(candidates)
+
         ranked = rank_candidates(
             candidates,
             now=now_utc,
@@ -261,7 +475,34 @@ class ClipSourcerService:
             minimum_view_count=self.config.minimum_view_count,
             seen_ids=seen_ids,
         )
-        unseen_ranked = [(candidate, score) for candidate, score in ranked if candidate.clip_id not in seen_ids]
+        unseen_ranked = [(candidate, score) for candidate, score in ranked if candidate.clip_id not in excluded_ids]
+        if not unseen_ranked and origin == "Cached":
+            logger.info("Candidate source: Apify; fetching new results because cached clips no longer pass eligibility filters.")
+            raw_items = self.fetch_items(self.config)
+            candidates = [ClipCandidate.from_apify_item(item) for item in raw_items]
+            origin = "Apify"
+            _log_play_count_distribution(candidates)
+            ranked = rank_candidates(
+                candidates,
+                now=now_utc,
+                lookback_hours=self.config.lookback_hours,
+                keyword=self.config.keyword_filter,
+                minimum_view_count=self.config.minimum_view_count,
+                seen_ids=seen_ids,
+            )
+            unseen_ranked = [(candidate, score) for candidate, score in ranked if candidate.clip_id not in excluded_ids]
+
+        _log_candidate_diagnostics(
+            candidates,
+            origin=origin,
+            now=now_utc,
+            lookback_hours=self.config.lookback_hours,
+            keyword=self.config.keyword_filter,
+            minimum_view_count=self.config.minimum_view_count,
+            seen_ids=seen_ids,
+            ranked=ranked,
+            unseen_ranked=unseen_ranked,
+        )
         logger.info(
             "Candidate gates: raw=%s -> ranked_eligible=%s -> unseen_ranked=%s.",
             len(candidates),
@@ -270,12 +511,33 @@ class ClipSourcerService:
         )
         if not unseen_ranked:
             logger.info("No eligible new clip found in this attempt because all matching clips are already seen or filtered out.")
+            self._save_candidate_cache([])
             return SourcingCycleOutcome(
                 status="no_match",
                 reason="all matching clips were already seen or filtered out",
             )
 
+        if origin == "Apify":
+            self._save_candidate_cache([candidate for candidate, _score in unseen_ranked])
         for best_candidate, score in unseen_ranked:
+            if best_candidate.clip_id in attempted_ids:
+                continue
+            self._reserve_candidate(best_candidate.clip_id, attempted_ids)
+            self._save_candidate_cache(
+                [candidate for candidate, _candidate_score in unseen_ranked if candidate.clip_id not in attempted_ids],
+                log_candidates=False,
+                required=True,
+            )
+            if origin == "Cached":
+                logger.info(
+                    "Using candidate from cache: id=%s author=%s views=%s viral_score=%.2f posted=%s url=%s",
+                    best_candidate.clip_id,
+                    best_candidate.author_handle or "unknown",
+                    best_candidate.plays,
+                    score,
+                    best_candidate.created_at.isoformat(),
+                    best_candidate.url,
+                )
             logger.info(
                 "Trying clip %s by @%s with %s plays and viral score %s.",
                 best_candidate.clip_id,

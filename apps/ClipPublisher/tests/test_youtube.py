@@ -94,10 +94,11 @@ class MultiPlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ig = mock.Mock(side_effect=RuntimeError("ig down"))
             yt = mock.Mock(side_effect=RuntimeError("yt down"))
-            queue, _, _, _, fail_alert, _, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig, yt=yt)
+            queue, seen, _, _, fail_alert, _, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig, yt=yt)
             self.assertIsNotNone(error)
             self.assertEqual(2, fail_alert.call_count)
             self.assertTrue((queue / "Archive" / "0001_x_failed").exists())
+            self.assertFalse(seen.exists())
 
     def test_unconfigured_youtube_is_skipped_quietly(self):
         with tempfile.TemporaryDirectory() as tmp:

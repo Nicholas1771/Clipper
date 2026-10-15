@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, datetime, timedelta
 import logging
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from clipscheduler.runner import STAGES, ClipSchedulerRunner
 from common.alerts import send_failure_alert
 from common.env import is_test_mode
 from common.logging_utils import configure_app_logging
+from common.platforms import YOUTUBE, publish_only
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +28,25 @@ logger = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Schedule the Clip pipeline based on a configurable window.")
     parser.add_argument("--now", action="store_true", help="Immediately mark the queue ready for sourcing, then keep running.")
+    parser.add_argument("--schedule", action="store_true", help="Run the start-of-day plan creation (as at 00:00), including YouTube selection, then exit without sourcing or publishing.")
+    parser.add_argument("--schedule-date", type=date.fromisoformat, help="Day (YYYY-MM-DD) to initialize with --schedule; default is tomorrow, the next production run.")
     parser.add_argument(
         "--stop-after",
         choices=STAGES,
-        help="Fire a cycle immediately without archiving the queue, and exit once this stage completes.",
+        help="Archive existing queue items, fire a fresh cycle immediately, and exit once this stage completes.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.schedule and (args.now or args.stop_after):
+        parser.error("--schedule cannot be combined with --now or --stop-after")
+    if args.schedule_date and not args.schedule:
+        parser.error("--schedule-date requires --schedule")
+    return args
 
 
 def run_until_stage(runner: ClipSchedulerRunner, stage: str) -> int:
-    runner.reset_state_files()
+    if runner.config.youtube_selection_mode == "instagram_top" and publish_only() == YOUTUBE:
+        raise ValueError("--stop-after is for fresh sourcing; omit it for scheduled YouTube replay.")
+    runner.force_reset_current_cycle()
     started = runner._local_now()
     runner._mark_ready(when=started)
     logger.info("ClipScheduler fired one cycle; waiting for stage '%s' to complete.", stage)
@@ -54,7 +65,35 @@ def main() -> int:
     configure_app_logging("ClipScheduler")
     try:
         args = parse_args()
+        if args.schedule and (is_test_mode() or publish_only()):
+            raise ValueError("--schedule requires normal account configuration, without test mode or a publish-only override.")
         runner = ClipSchedulerRunner(AppConfig.from_repo_root(APP_ROOT))
+        if args.schedule:
+            local_now = runner._local_now()
+            day = args.schedule_date or local_now.date() + timedelta(days=1)
+            start_of_day = datetime.combine(day, datetime.min.time(), local_now.tzinfo)
+            logger.info("SIMULATION (nothing is saved, sent, sourced or published): start-of-day schedule for %s at %s.", day, start_of_day.isoformat())
+            plan, youtube = runner.simulate_day(start_of_day)
+            for index, slot in enumerate(plan.slots):
+                logger.info("  Slot %s: %s [%s]", index + 1, slot.strftime("%Y-%m-%d %H:%M:%S %Z"), "+".join(plan.platforms_for(index)) or "none")
+            for slot in plan.youtube_slots:
+                logger.info("  YouTube slot: %s", slot.strftime("%Y-%m-%d %H:%M:%S %Z"))
+            if not plan.youtube_slots:
+                logger.info("YouTube selection: no YouTube slots for this configuration.")
+            elif youtube is None:
+                logger.warning("YouTube selection: could not be completed (see errors above); production would retry every five minutes until the window closes.")
+            else:
+                logger.info("YouTube selection from Instagram posts on %s:", youtube["source_date"])
+                for entry in youtube["entries"]:
+                    logger.info("  #%s %s (IG media %s): %s views -> YouTube at %s", entry["rank"], entry["clip_id"], entry["media_id"], entry["views"], entry["scheduled_for"])
+                if youtube["unscheduled"]:
+                    logger.info("  Ranked but not scheduled: %s", ", ".join(youtube["unscheduled"]))
+                for item in youtube["excluded"]:
+                    logger.info("  Excluded %s: %s", item.get("clip_id"), item.get("reason"))
+                if not youtube["entries"]:
+                    logger.info("  No eligible Instagram posts; no YouTube upload would be scheduled.")
+            logger.info("Simulation complete: %s pipeline slot(s), %s YouTube slot(s). No files written.", len(plan.slots), len(plan.youtube_slots))
+            return 0
         if args.stop_after:
             return run_until_stage(runner, args.stop_after)
         if is_test_mode():

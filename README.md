@@ -60,15 +60,33 @@ python run_all_apps.py --<name>    # available flags come from profiles\<name>.e
 
 To add an account, copy `profiles\template.env.example` to `profiles\<name>.env`, replace its sample values, and place the branding image in `data\assets` (or use a full path in `OVERLAY_IMAGE_PATH`). The flag `--<name>` becomes available automatically. Give each profile its own `QUEUE_DIR`, state files, and token state file so runs never mix. All real `*.env` files are git-ignored. When running a single app directly, set `CLIPPER_PROFILE=<name>`; if unset, the first available profile alphabetically is selected.
 
+To simulate the start-of-day schedule creation (as production does around midnight), then exit:
+
+```powershell
+python run_all_apps.py --n3on --schedule
+python run_all_apps.py --n3on --schedule --schedule-date=2026-10-15
+```
+
+Use `--navaeh` for the other account. The default day is tomorrow, simulated at 00:00 —
+so YouTube ranking uses today's successful Instagram posts. This is a **read-only
+simulation**: it logs the generated slots, platform assignments, YouTube slot, fetched
+Instagram views and ranking, but writes no plan/history/token files, sends no emails,
+refreshes no token, and starts no Sourcer, AI, Editor or Publisher. Slot times are random,
+so production will pick different times. Only posts in this machine's local archive are
+eligible (production-only archives are not available locally). Do not combine with
+`--now`, `--stop-after`, `--test`, or `--publish`.
+
 Load order is now: process env > `profiles\<name>.env` > `apps\<AppName>\.env` > `<repo>\.env`.
 
 ## YouTube Shorts publishing
 
-Each profile can also upload to YouTube. Set `INSTAGRAM_POSTS_PER_DAY` and `YOUTUBE_POSTS_PER_DAY` in the profile (`YOUTUBE_POSTS_PER_DAY=0` disables YouTube). The scheduler plans `max(instagram, youtube)` slots per day; the busier platform posts in every slot and the other is randomly assigned to a subset. Each slot's platforms are stored in `scheduler_state.json`, and ClipPublisher publishes only to those.
+Each profile can also upload to YouTube. Set `INSTAGRAM_POSTS_PER_DAY` and `YOUTUBE_POSTS_PER_DAY` in the profile (`YOUTUBE_POSTS_PER_DAY=0` disables YouTube). The supplied profiles use `YOUTUBE_SELECTION_MODE=instagram_top`: when the daily plan is first created, yesterday's successful Instagram posts are ranked by Instagram views and the top unused clip is scheduled in a separate 10 AM-noon YouTube window. No posts yesterday means no YouTube post today. Instagram keeps its existing sourcing and schedule. See [ClipScheduler](apps/ClipScheduler/README.md) for timing, permissions, and restart behavior.
+
+`YOUTUBE_SELECTION_MODE=shared` retains the previous behavior: the scheduler plans `max(instagram, youtube)` slots per day and randomly assigns the lighter platform to a subset.
 
 - The Short's title is the AI caption followed by the streamer hashtag and the AI hashtags, all in the title (100 characters max; hashtags that would not fit are dropped). Shorts have no description.
 - One-time login per profile: `$env:CLIPPER_PROFILE='n3on'; python apps\ClipPublisher\main.py --youtube-auth` (needs `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` in the root `.env`). The refresh token is saved to `YOUTUBE_TOKEN_FILE` (git-ignored).
-- `--publish youtube` or `--publish instagram` on `run_all_apps.py` restricts the run to one platform: every slot targets only that platform (at its own posts-per-day, or the busier rate if it has none), overriding any saved plan. Example: `python run_all_apps.py --n3on --now --publish youtube`.
+- `--publish youtube` or `--publish instagram` on `run_all_apps.py` restricts the run to one platform. In `instagram_top` mode, YouTube-only runs use the separate morning replay plan, not fresh sourcing or an immediate Instagram post. In `shared` mode, every slot targets only the selected platform.
 - A slot assigned to YouTube while no token exists is skipped with a warning. Platforms publish independently, so one failing does not block the other.
 
 ## Run all 5 apps together (recommended)
@@ -118,6 +136,7 @@ Useful launcher options:
   - set `WATERMARK_FONT_FILE` or `WATERMARK_FONT_NAME`
   - for ClipPublisher, prefer Cloudflare R2 via `R2_*` settings instead of a local tunnel
 - Everything file-based lives under the root `data\` folder: `data\assets` (branding PNGs) and `data\prompts` (AI prompts) are tracked in Git, while per-profile queues and state (`data\state\<ACCOUNT_NAME>\...`) are ignored and stay local to each environment.
+- After a real publish from a workstation, `python sync_seen_ids.py --<profile>` appends local seen IDs to production (append-only; automatic when `SYNC_SEEN_TO_PRODUCTION=true` in the workstation `.env`). See `PRODUCTION_DEPLOYMENT.md`.
 
 ## Email alerts
 

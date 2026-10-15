@@ -5,6 +5,19 @@ import re
 from pathlib import Path
 
 
+def read_dotenv(dotenv_path: Path) -> dict[str, str]:
+    """Key/value pairs of a .env file without touching the process environment."""
+    values: dict[str, str] = {}
+    if not dotenv_path.exists():
+        return values
+    for raw_line in dotenv_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
 def load_dotenv(dotenv_path: Path, *, override: bool = False) -> None:
     if not dotenv_path.exists():
         return

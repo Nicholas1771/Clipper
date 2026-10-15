@@ -44,6 +44,12 @@ class AppConfig:
     youtube_token_file: Path = Path("data/state/youtube_token.json")
     youtube_privacy_status: str = "public"
     youtube_category_id: str = "24"
+    instagram_insights_api_version: str = "v24.0"
+    youtube_selection_mode: str = "shared"
+    youtube_posts_per_day: int = 0
+    youtube_start_hour: int = 10
+    youtube_end_hour: int = 12
+    replay_profile: str = "default"
 
     @classmethod
     def from_repo_root(cls, repo_root: Path, *, resolve_media_url: bool = True) -> "AppConfig":
@@ -77,6 +83,12 @@ class AppConfig:
             youtube_token_file = root_dir / youtube_token_file
 
         return cls(
+            youtube_selection_mode=os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip().lower() or "shared",
+            youtube_posts_per_day=int(os.getenv("YOUTUBE_POSTS_PER_DAY", "").strip() or "0"),
+            youtube_start_hour=int(os.getenv("YOUTUBE_SCHEDULE_START_HOUR", "10")),
+            youtube_end_hour=int(os.getenv("YOUTUBE_SCHEDULE_END_HOUR", "12")),
+            replay_profile=os.getenv("CLIPPER_PROFILE", "default").strip().lower() or "default",
+            instagram_insights_api_version=os.getenv("INSTAGRAM_INSIGHTS_API_VERSION", "v24.0").strip() or "v24.0",
             youtube_client_id=os.getenv("YOUTUBE_CLIENT_ID", "").strip(),
             youtube_client_secret=os.getenv("YOUTUBE_CLIENT_SECRET", "").strip(),
             youtube_token_file=youtube_token_file,

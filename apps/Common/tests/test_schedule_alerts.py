@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest import mock
+from zoneinfo import ZoneInfo
+
+from common.alerts import format_alert_subject
+from common.schedule_alerts import (
+    ProfileConfig,
+    ScheduleSlot,
+    _profile_plans_ready,
+    build_schedule_alert_body,
+    build_started_alert_body,
+    check_platform_status,
+    collect_schedule_slots,
+    discover_profile_configs,
+    send_consolidated_schedule_alert,
+    send_consolidated_started_alert,
+)
+
+TZ = ZoneInfo("America/New_York")
+
+
+class ScheduleAlertFormattingTests(unittest.TestCase):
+    def test_schedule_includes_selected_youtube_replay_not_empty_opportunities(self):
+        with TemporaryDirectory() as tmp:
+            queue = Path(tmp)
+            profile = mock.Mock(
+                queue_dir=queue, account_name="account", timezone_name="America/New_York",
+            )
+            (queue / "scheduler_plan.json").write_text(json.dumps({
+                "date": "2026-10-14",
+                "slots": ["2026-10-14T18:00:00-04:00"],
+                "platforms": [["instagram"]],
+                "next_index": 0,
+                "youtube_slots": ["2026-10-14T11:00:00-04:00"],
+            }))
+            youtube_file = queue / "youtube_plan.json"
+            youtube_file.write_text(json.dumps({
+                "date": "2026-10-14",
+                "entries": [{
+                    "scheduled_for": "2026-10-14T11:00:00-04:00", "status": "pending",
+                }],
+            }))
+            now = datetime(2026, 10, 14, 0, tzinfo=TZ)
+            with mock.patch("common.schedule_alerts.discover_profile_configs", return_value=[profile]):
+                all_slots, remaining, _ = collect_schedule_slots(queue, now.date(), now)
+                self.assertEqual(["YouTube", "Instagram"], [slot.platforms for slot in all_slots])
+                self.assertEqual(2, len(remaining))
+                youtube_file.write_text(json.dumps({"date": "2026-10-14", "entries": []}))
+                all_slots, _, _ = collect_schedule_slots(queue, now.date(), now)
+                self.assertEqual(["Instagram"], [slot.platforms for slot in all_slots])
+
+    def test_alert_waits_for_other_profiles_youtube_replay_plan(self):
+        with TemporaryDirectory() as tmp:
+            queue = Path(tmp)
+            profile = mock.Mock(queue_dir=queue, youtube_selection_mode="instagram_top", youtube_posts_per_day=1)
+            today = date(2026, 10, 15)
+            (queue / "scheduler_plan.json").write_text(json.dumps({"date": "2026-10-15"}))
+            self.assertFalse(_profile_plans_ready(profile, today))
+            (queue / "youtube_plan.json").write_text(json.dumps({"date": "2026-10-14"}))
+            self.assertFalse(_profile_plans_ready(profile, today))
+            (queue / "youtube_plan.json").write_text(json.dumps({"date": "2026-10-15"}))
+            self.assertTrue(_profile_plans_ready(profile, today))
+            shared = mock.Mock(queue_dir=queue, youtube_selection_mode="shared", youtube_posts_per_day=1)
+            (queue / "youtube_plan.json").unlink()
+            self.assertTrue(_profile_plans_ready(shared, today))
+
+    def test_subject_omits_platform_and_account_for_schedule_and_started(self):
+        with mock.patch.dict(os.environ, {"ACCOUNT_NAME": "CarootClips", "ENVIRONMENT": "PROD"}):
+            self.assertEqual(
+                "[PROD] Schedule - 20261012",
+                format_alert_subject(subject="Schedule - 20261012"),
+            )
+            self.assertEqual(
+                "[PROD] Started - 20261012",
+                format_alert_subject(subject="Started - 20261012"),
+            )
+
+    def test_check_platform_status_ok(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            token_state = tmp_path / "publisher_token_state.json"
+            future_exp = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+            token_state.write_text(json.dumps({"access_token": "tok123", "expires_at": future_exp}))
+
+            yt_token = tmp_path / "youtube_token.json"
+            yt_token.write_text(json.dumps({"refresh_token": "ref123"}))
+
+            profile = ProfileConfig(
+                profile_name="n3on",
+                account_name="CarootClips",
+                queue_dir=tmp_path / "queue",
+                instagram_posts_per_day=5,
+                youtube_posts_per_day=1,
+                instagram_user_id="17841467426737362",
+                instagram_access_token="tok123",
+                token_state_file=token_state,
+                youtube_client_id="yt_id",
+                youtube_client_secret="yt_sec",
+                youtube_token_file=yt_token,
+                schedule_start_hour=8,
+                schedule_end_hour=23,
+                timezone_name="America/New_York",
+            )
+
+            status = check_platform_status(profile)
+            self.assertEqual("OK", status["Instagram"])
+            self.assertEqual("OK", status["YouTube"])
+
+    def test_check_platform_status_catches_missing_instagram_user_id(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            profile = ProfileConfig(
+                profile_name="navaeh",
+                account_name="VrlClipMoments",
+                queue_dir=tmp_path / "queue",
+                instagram_posts_per_day=5,
+                youtube_posts_per_day=1,
+                instagram_user_id="",  # missing!
+                instagram_access_token="tok123",
+                token_state_file=None,
+                youtube_client_id="yt_id",
+                youtube_client_secret="yt_sec",
+                youtube_token_file=None,
+                schedule_start_hour=8,
+                schedule_end_hour=23,
+                timezone_name="America/New_York",
+            )
+            status = check_platform_status(profile)
+            self.assertIn("ERROR - INSTAGRAM_USER_ID is required for publishing", status["Instagram"])
+            self.assertIn("ERROR", status["YouTube"])
+
+    def test_check_platform_status_catches_expired_token(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            token_state = tmp_path / "publisher_token_state.json"
+            past_exp = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            token_state.write_text(json.dumps({"access_token": "tok123", "expires_at": past_exp}))
+
+            profile = ProfileConfig(
+                profile_name="n3on",
+                account_name="CarootClips",
+                queue_dir=tmp_path / "queue",
+                instagram_posts_per_day=5,
+                youtube_posts_per_day=0,
+                instagram_user_id="12345",
+                instagram_access_token="tok123",
+                token_state_file=token_state,
+                youtube_client_id="",
+                youtube_client_secret="",
+                youtube_token_file=None,
+                schedule_start_hour=8,
+                schedule_end_hour=23,
+                timezone_name="America/New_York",
+            )
+            status = check_platform_status(profile)
+            self.assertIn("ERROR - Token expired", status["Instagram"])
+            self.assertEqual("Disabled (0 posts/day)", status["YouTube"])
+
+    def test_build_started_alert_body_formatting(self):
+        status_map = {
+            "CarootClips": {"Instagram": "OK", "YouTube": "OK"},
+            "VrlClipMoments": {"Instagram": "ERROR - INSTAGRAM_USER_ID is required for publishing", "YouTube": "OK"},
+        }
+        remaining = [
+            ScheduleSlot(
+                time=datetime(2026, 10, 12, 20, 58, 27, tzinfo=TZ),
+                account="CarootClips",
+                platforms="Instagram",
+                is_remaining=True,
+            ),
+            ScheduleSlot(
+                time=datetime(2026, 10, 12, 21, 41, 23, tzinfo=TZ),
+                account="VrlClipMoments",
+                platforms="Instagram, YouTube",
+                is_remaining=True,
+            ),
+        ]
+        body = build_started_alert_body(
+            profiles_status=status_map,
+            remaining_slots=remaining,
+            today=date(2026, 10, 12),
+            tz_name="America/New_York",
+            start_hour=8,
+            end_hour=23,
+        )
+        self.assertIn("Clipper Started for 20261012 (America/New_York).", body)
+        self.assertIn("posts remaining: 2", body)
+        self.assertIn("Platform Status:", body)
+        self.assertIn("* CarootClips:", body)
+        self.assertIn("- Instagram: OK", body)
+        self.assertIn("- YouTube: OK", body)
+        self.assertIn("* VrlClipMoments:", body)
+        self.assertIn("- Instagram: ERROR - INSTAGRAM_USER_ID is required for publishing", body)
+        self.assertIn("Remaining Schedule:", body)
+        self.assertIn("1. 2026-10-12 20:58:27 EDT | CarootClips | Instagram", body)
+        self.assertIn("2. 2026-10-12 21:41:23 EDT | VrlClipMoments | Instagram, YouTube", body)
+
+    def test_build_schedule_alert_body_ordering(self):
+        slots = [
+            ScheduleSlot(
+                time=datetime(2026, 10, 12, 10, 8, 6, tzinfo=TZ),
+                account="CarootClips",
+                platforms="Instagram",
+            ),
+            ScheduleSlot(
+                time=datetime(2026, 10, 12, 11, 9, 15, tzinfo=TZ),
+                account="VrlClipMoments",
+                platforms="Instagram",
+            ),
+            ScheduleSlot(
+                time=datetime(2026, 10, 12, 16, 52, 31, tzinfo=TZ),
+                account="CarootClips",
+                platforms="Instagram, YouTube",
+            ),
+        ]
+        body = build_schedule_alert_body(
+            all_slots=slots,
+            today=date(2026, 10, 12),
+            tz_name="America/New_York",
+            start_hour=8,
+            end_hour=23,
+        )
+        self.assertIn("Clipper New schedule for 20261012 (America/New_York).", body)
+        self.assertIn("posts planned: 3", body)
+        self.assertIn("Planned Schedule:", body)
+        self.assertIn("1. 2026-10-12 10:08:06 EDT | CarootClips | Instagram", body)
+        self.assertIn("2. 2026-10-12 11:09:15 EDT | VrlClipMoments | Instagram", body)
+        self.assertIn("3. 2026-10-12 16:52:31 EDT | CarootClips | Instagram, YouTube", body)
+
+    def test_schedule_alert_deduplication_for_same_date(self):
+        with TemporaryDirectory() as tmp:
+            tmp_repo = Path(tmp)
+            sent_count = 0
+
+            def fake_send(*args, **kwargs):
+                nonlocal sent_count
+                sent_count += 1
+                return True
+
+            now = datetime(2026, 10, 12, 8, 0, tzinfo=TZ)
+            with mock.patch("common.schedule_alerts.sys.modules", {}):
+                first = send_consolidated_schedule_alert(
+                    tmp_repo, now, send_alert_fn=fake_send
+                )
+                second = send_consolidated_schedule_alert(
+                    tmp_repo, now, send_alert_fn=fake_send
+                )
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual(1, sent_count)
+
+    def test_started_alert_cooldown_deduplication(self):
+        with TemporaryDirectory() as tmp:
+            tmp_repo = Path(tmp)
+            sent_count = 0
+
+            def fake_send(*args, **kwargs):
+                nonlocal sent_count
+                sent_count += 1
+                return True
+
+            now = datetime(2026, 10, 12, 8, 0, tzinfo=TZ)
+            with mock.patch("common.schedule_alerts.sys.modules", {}):
+                first = send_consolidated_started_alert(
+                    tmp_repo, now, send_alert_fn=fake_send
+                )
+                second = send_consolidated_started_alert(
+                    tmp_repo, now, send_alert_fn=fake_send
+                )
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual(1, sent_count)
+
+
+if __name__ == "__main__":
+    unittest.main()

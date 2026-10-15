@@ -15,12 +15,13 @@ from zoneinfo import ZoneInfo
 APP_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = APP_ROOT / "src"
 COMMON_SRC_ROOT = APP_ROOT.parent / "Common" / "src"
-for path in (SRC_ROOT, COMMON_SRC_ROOT):
+for path in (APP_ROOT, SRC_ROOT, COMMON_SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 from clipscheduler.config import AppConfig
 from clipscheduler.runner import ClipSchedulerRunner
+from main import run_until_stage
 
 TZ = ZoneInfo("America/New_York")
 
@@ -59,24 +60,17 @@ class SlotGenerationTests(unittest.TestCase):
         for earlier, later in zip(slots, slots[1:]):
             self.assertGreaterEqual((later - earlier).total_seconds(), gap_seconds)
 
-    def test_before_window_generates_full_day_near_target(self) -> None:
-        counts = []
+    def test_before_window_generates_exact_full_day(self) -> None:
         for seed in range(300):
             slots = make_runner(self.queue, seed)._generate_daily_slots(at(6))
             self.assert_valid(slots, at(10), at(22))
-            counts.append(len(slots))
-        self.assertGreaterEqual(min(counts), 10)
-        self.assertLessEqual(max(counts), 14)
-        self.assertAlmostEqual(sum(counts) / len(counts), 12, delta=0.4)
-        self.assertGreater(len(set(counts)), 1)
+            self.assertEqual(12, len(slots))
 
-    def test_midway_generates_about_half(self) -> None:
-        counts = []
+    def test_midway_generates_exactly_half(self) -> None:
         for seed in range(300):
             slots = make_runner(self.queue, seed)._generate_daily_slots(at(16))
             self.assert_valid(slots, at(16), at(22))
-            counts.append(len(slots))
-        self.assertAlmostEqual(sum(counts) / len(counts), 6, delta=0.4)
+            self.assertEqual(6, len(slots))
 
     def test_distribution_is_even(self) -> None:
         for seed in range(200):
@@ -140,12 +134,63 @@ class PlatformAssignmentTests(unittest.TestCase):
         plan = runner.ensure_plan(at(6))
         self.assertEqual([["instagram"]] * len(plan.slots), plan.platforms)
 
+    def test_ranked_youtube_has_independent_exact_morning_quota(self) -> None:
+        runner = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        with patch.object(runner, "_prepare_youtube_selection", return_value=True) as prepare:
+            plan = runner.ensure_plan(at(0))
+            runner.ensure_plan(at(1))
+        self.assertEqual([["instagram"]] * len(plan.slots), plan.platforms)
+        self.assertEqual(1, len(plan.youtube_slots))
+        self.assertGreaterEqual(plan.youtube_slots[0], at(10))
+        self.assertLess(plan.youtube_slots[0], at(12))
+        prepare.assert_called_once_with(at(0), plan.youtube_slots)
+
+    def test_youtube_plan_generation_after_window_does_not_schedule_backdated_upload(self) -> None:
+        runner = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        with patch.object(runner, "_prepare_youtube_selection") as prepare:
+            plan = runner.ensure_plan(at(13))
+        self.assertEqual([], plan.youtube_slots)
+        prepare.assert_not_called()
+        self.assertTrue(plan.slots)
+
+    def test_failed_youtube_selection_retries_without_blocking_instagram(self) -> None:
+        runner = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        with patch.object(runner, "_prepare_youtube_selection", side_effect=[False, True]) as prepare:
+            first = runner.ensure_plan(at(0))
+            runner.ensure_plan(at(0, 1))
+            second = runner.ensure_plan(at(0, 5))
+        self.assertIs(first, second)
+        self.assertEqual(2, prepare.call_count)
+        self.assertTrue(first.slots)
+
+    def test_ranked_youtube_only_now_does_not_signal_fresh_source_or_instagram(self) -> None:
+        runner = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "youtube"}):
+            with patch.object(runner, "_local_now", return_value=at(0)):
+                with patch.object(runner, "_prepare_youtube_selection", return_value=True):
+                    self.assertEqual("waiting", runner.fire_now())
+        self.assertFalse((self.queue / "scheduler_state.json").exists())
+        self.assertEqual([], runner._plan.slots)
+
+    def test_ranked_youtube_slots_and_history_survive_startup(self) -> None:
+        first = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        with patch.object(first, "_prepare_youtube_selection", return_value=True):
+            original = first.ensure_plan(at(0))
+        for name in ("youtube_plan.json", "youtube_history.json"):
+            (self.queue / name).write_text("{}", encoding="utf-8")
+        restarted = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
+        restarted.prepare_startup()
+        with patch.object(restarted, "_prepare_youtube_selection", return_value=True):
+            plan = restarted.ensure_plan(at(1))
+        self.assertEqual(original.youtube_slots, plan.youtube_slots)
+        self.assertEqual(original.slots, plan.slots)
+        self.assertTrue((self.queue / "youtube_history.json").exists())
+        self.assertTrue((self.queue / "youtube_plan.json").exists())
+
     def test_slot_count_follows_the_busier_platform(self) -> None:
-        counts = []
         for seed in range(200):
             runner = make_runner(self.queue, seed, instagram_posts_per_day=3, youtube_posts_per_day=12)
-            counts.append(len(runner._generate_daily_slots(at(6))))
-        self.assertAlmostEqual(sum(counts) / len(counts), 12, delta=0.5)
+            self.assertEqual(12, len(runner._generate_daily_slots(at(6))))
 
     def test_every_slot_is_used_and_the_lighter_platform_gets_a_random_subset(self) -> None:
         youtube_positions = set()
@@ -401,11 +446,16 @@ class RestartTests(unittest.TestCase):
         first = make_runner(self.queue)
         plan = first.ensure_plan(at(6))
         first.run_once(plan.slots[1])
+        interrupted_item = self.queue / "interrupted_run"
+        interrupted_item.mkdir()
+        (interrupted_item / "queue_state.json").write_text('{"phase":"sourced"}', encoding="utf-8")
         self.assertEqual("scheduled", json.loads((self.queue / "scheduler_state.json").read_text(encoding="utf-8"))["phase"])
         second = self.restart()
         resumed = second.ensure_plan(plan.slots[1] + timedelta(minutes=1))
         self.assertEqual(plan.slots, resumed.slots)
         self.assertEqual(first._plan.slots.index(plan.slots[1]), resumed.next_index)
+        self.assertFalse(interrupted_item.exists())
+        self.assertTrue((self.queue / "Archive" / "interrupted_run").exists())
 
     def test_restart_after_window_has_nothing_left(self) -> None:
         first = make_runner(self.queue)
@@ -423,6 +473,22 @@ class RestartTests(unittest.TestCase):
         plan = second.ensure_plan(at(6, day=7))
         self.assertTrue(all(slot.day == 7 for slot in plan.slots))
         self.assertTrue(self.alert.call_args.kwargs["subject"].startswith("Started"))
+
+    def test_stop_after_archives_stale_queue_before_firing_fresh_cycle(self) -> None:
+        runner = make_runner(self.queue)
+        stale_item = self.queue / "old_clip"
+        stale_item.mkdir(parents=True)
+        (stale_item / "queue_state.json").write_text('{"phase":"ai_processed"}', encoding="utf-8")
+
+        with patch.object(runner, "stage_status", return_value="reached") as stage_status:
+            result = run_until_stage(runner, "editor")
+
+        self.assertEqual(0, result)
+        self.assertFalse(stale_item.exists())
+        self.assertTrue((self.queue / "Archive" / "old_clip").exists())
+        state = json.loads((self.queue / "scheduler_state.json").read_text(encoding="utf-8"))
+        self.assertEqual("scheduled", state["phase"])
+        stage_status.assert_called_once_with("editor")
 
     def test_restart_with_corrupt_plan_generates_new_plan(self) -> None:
         (self.queue / "scheduler_plan.json").write_text("{not json", encoding="utf-8")

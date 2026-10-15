@@ -18,15 +18,24 @@ class AppConfig:
     min_gap_minutes: int
     timezone_name: str
     youtube_posts_per_day: int = 0
+    youtube_selection_mode: str = "shared"
+    youtube_start_hour: int = 10
+    youtube_end_hour: int = 12
+    youtube_peak_hour: int = 11
 
     @property
     def slots_per_day(self) -> int:
         """One slot per clip: as many as the busiest platform needs."""
+        if self.youtube_selection_mode == "instagram_top":
+            return max(0, self.instagram_posts_per_day)
         return max(0, self.instagram_posts_per_day, self.youtube_posts_per_day)
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
         root_dir = load_app_env(repo_root)
+        youtube_mode = os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip()
+        if youtube_mode not in {"shared", "instagram_top"}:
+            raise ValueError("YOUTUBE_SELECTION_MODE must be shared or instagram_top.")
         queue_raw = os.getenv("QUEUE_DIR", "data/queue").strip()
         if os.name != "nt" and looks_like_windows_path(queue_raw):
             queue_raw = "data/queue"
@@ -43,4 +52,8 @@ class AppConfig:
             min_gap_minutes=int(os.getenv("MIN_GAP_MINUTES", "75")),
             timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
             youtube_posts_per_day=int(os.getenv("YOUTUBE_POSTS_PER_DAY", "").strip() or "0"),
+            youtube_selection_mode=youtube_mode,
+            youtube_start_hour=int(os.getenv("YOUTUBE_SCHEDULE_START_HOUR", "10")),
+            youtube_end_hour=int(os.getenv("YOUTUBE_SCHEDULE_END_HOUR", "12")),
+            youtube_peak_hour=int(os.getenv("YOUTUBE_SCHEDULE_PEAK_HOUR", "11")),
         )

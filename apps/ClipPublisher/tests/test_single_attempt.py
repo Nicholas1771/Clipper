@@ -46,9 +46,8 @@ class SingleAttemptTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual([p.name for p in queue.iterdir() if p.name not in {"processing", "Archive", "scheduler_state.json"}], [])
             self.assertTrue((queue / "Archive" / "0001_x_failed").exists())
-            self.assertIn("123", json.loads(seen.read_text())["seen_ids"])
+            self.assertFalse(seen.exists())
 
 
 if __name__ == "__main__":
     unittest.main()
-

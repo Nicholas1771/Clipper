@@ -1,0 +1,6 @@
+Cost analysis
+Appify $0.11CAD/query - $1.1CAD/day $4.27CAD/1000 requests ($3.00USD/1000)
+AI $0.2/day
+Cloud Hosting $0.10/day
+
+Total - $1.4CAD/day

@@ -34,7 +34,13 @@ def platform_tag(platform: str) -> str:
     return "IG/YT"
 
 
-def format_alert_subject(*, subject: str, platform: str = "") -> str:
+def format_alert_subject(
+    *,
+    subject: str,
+    platform: str = "",
+    include_platform: bool | None = None,
+    include_account: bool | None = None,
+) -> str:
     env = environment_tag()
     plat = platform_tag(platform)
     account = os.getenv("ACCOUNT_NAME", "").strip() or "Clipper"
@@ -58,10 +64,30 @@ def format_alert_subject(*, subject: str, platform: str = "") -> str:
                 rest = cleaned
                 changed = True
 
-    return f"[{env}] [{plat}] [{account}] {rest}"
+    is_schedule_or_start = bool(re.match(r"^(Schedule|Started)\b", rest, re.IGNORECASE))
+    if include_platform is None:
+        include_platform = not is_schedule_or_start
+    if include_account is None:
+        include_account = not is_schedule_or_start
+
+    parts = [f"[{env}]"]
+    if include_platform:
+        parts.append(f"[{plat}]")
+    if include_account:
+        parts.append(f"[{account}]")
+    parts.append(rest)
+    return " ".join(parts)
 
 
-def send_email_alert(*, app_name: str, subject: str, body: str, platform: str = "") -> bool:
+def send_email_alert(
+    *,
+    app_name: str,
+    subject: str,
+    body: str,
+    platform: str = "",
+    include_platform: bool | None = None,
+    include_account: bool | None = None,
+) -> bool:
     enabled = parse_bool(os.getenv("ALERT_EMAIL_ENABLED"), default=True, strict=False)
     if not enabled:
         return False
@@ -83,7 +109,12 @@ def send_email_alert(*, app_name: str, subject: str, body: str, platform: str = 
         logger.warning("Email alert skipped because ALERT_EMAIL_FROM (or ALERT_EMAIL_USERNAME) is not configured.")
         return False
 
-    final_subject = format_alert_subject(subject=subject, platform=platform)
+    final_subject = format_alert_subject(
+        subject=subject,
+        platform=platform,
+        include_platform=include_platform,
+        include_account=include_account,
+    )
 
     message = EmailMessage()
     message["Subject"] = final_subject

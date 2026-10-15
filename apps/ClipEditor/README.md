@@ -4,7 +4,7 @@ ClipEditor is the pipeline stage between ClipSourcer and ClipPublisher.
 
 It watches the queue for runs that are already sourced and then:
 
-- overlays the profile's configured branding image near the lower third of the clip
+- overlays the profile's configured branding image as the top layer, always between `KICK_OVERLAY_TOP_Y` and `KICK_OVERLAY_BOTTOM_Y` and never over the account watermark: at ClipAI's confirmed clear spot (`kick_overlay_y`), otherwise the middle of that range when captions sit at the top and bottom, otherwise the configured spot moved clear of caption text
 - adds a translucent white watermark using the profile's `ACCOUNT_NAME`
 - writes `caption.txt`, `title.txt`, and `description.txt` to the queue item
 - marks the queue item as `edited` so ClipPublisher can pick it up safely

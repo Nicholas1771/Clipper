@@ -37,14 +37,14 @@ class AlertFormattingTests(unittest.TestCase):
     def test_prod_schedule_alert(self):
         with mock.patch.dict(os.environ, {"ACCOUNT_NAME": "CarootClips", "ENVIRONMENT": "PROD"}):
             self.assertEqual(
-                "[PROD] [IG] [CarootClips] Schedule - 20261012",
+                "[PROD] Schedule - 20261012",
                 format_alert_subject(subject="Schedule - 20261012", platform="Instagram"),
             )
 
     def test_prod_started_alert(self):
         with mock.patch.dict(os.environ, {"ACCOUNT_NAME": "CarootClips", "ENVIRONMENT": "PROD"}):
             self.assertEqual(
-                "[PROD] [YT] [CarootClips] Started - 20261012",
+                "[PROD] Started - 20261012",
                 format_alert_subject(subject="Started - 20261012", platform="YouTube"),
             )
 

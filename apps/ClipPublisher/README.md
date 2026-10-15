@@ -29,6 +29,8 @@ ClipPublisher itself has no independent scheduling window logic. It publishes wh
 
 This app watches the configured queue directory and waits for a run directory to be fully ready before claiming it.
 
+`seen_ids` records only clips successfully published to at least one assigned platform. Failed or skipped publishes do not mark a clip seen. Failed items are still quarantined without retry; ClipSourcer tracks attempted candidates separately from published history.
+
 A queue item is considered ready only if:
 
 - the run directory exists
@@ -39,6 +41,25 @@ A queue item is considered ready only if:
 The app then claims the item in place by setting its `queue_state.json` phase to `published`, so it is never picked twice. Failed or finished items are moved to `Archive/`.
 
 This gives a simple safety check so the Publisher does not pick up a half-written queue item.
+
+## YouTube replay of yesterday's best Instagram clips
+
+`clippublisher.youtube_replay.YouTubeReplay(config)` replays yesterday's most-viewed Instagram clips to YouTube. ClipScheduler drives it (loading the Publisher `AppConfig` lazily):
+
+- `prepare(now, slots) -> bool`: call when the day's schedule is first generated. "Yesterday" is the previous calendar day in `TIMEZONE_NAME`. It scans `Archive/` (and `processing/`) for successful Instagram `publisher/publish_state.json` records (legacy single-IG `result` or nested `result.instagram`; timestamp `published_at.instagram`, falling back to `updated_at`), requires archived local media, skips clips already on YouTube, reads Meta media insights `metric=views`, and ranks by views (ties: earlier IG publish, then clip id). Returns `True` when a complete snapshot is saved (empty, without API calls, when there are no eligible posts); returns `False` when any eligible clip's views are unknown. A completed snapshot for the same day is never re-ranked.
+- `process_due(now) -> bool`: uploads at most one due planned clip with `publish_to_youtube` (never Instagram), using the archived video and the same YouTube metadata. The entry is persisted as `attempted` (plan and `youtube_history.json`) before uploading; failures are logged, alerted and never retried. Success is written to history before the success notification. Sourcer `seen_ids` are not touched.
+
+Both files are written atomically in `QUEUE_DIR`. Publish states now also record `published_at` per platform.
+
+Preparation completes only when every eligible clip has a known views count. Missing metrics and unavailable insights now return `False` for retry, even if other clips have known counts; they are not excluded to produce an incomplete ranking. All-missing insights do not create an empty completed plan. An actual reported count of zero is valid.
+
+Replay honors `YOUTUBE_POSTS_PER_DAY` (default `0`, disabled), `YOUTUBE_SELECTION_MODE` (default `shared`), and `YOUTUBE_SCHEDULE_START_HOUR`/`YOUTUBE_SCHEDULE_END_HOUR` (defaults `10`/`12`). At or after the end hour, remaining pending entries become `failed` with a `missed_window` error without uploading or adding upload history. Daily attempt counts in both plan and history enforce the quota. Plans persist `profile` and `instagram_user_id`; a same-day snapshot from another account, or without account identity, blocks preparation and uploads rather than being reused or reranked. Keep each profile's queue separate.
+
+`INSTAGRAM_INSIGHTS_API_VERSION` pins the dedicated insights endpoint (default `v24.0`; accepts `v23.0` or newer). It does not change the existing Instagram publishing API version. Token and permission failures block preparation for retry after credentials/permissions are repaired; there is no random or zero-view fallback.
+
+Plan entries expose `scheduled_for` (ISO datetime; `slot` is retained for compatibility), `status` (`pending`, `attempted`, `published`, or `failed`), `clip_id`, `media_id`, `run_dir`, `views`, `instagram_published_at`, and `rank`. Account-matched older snapshots with `slot` and `planned` remain usable without re-ranking. When an archived clip has no editor description, replay metadata uses `ai/summary.txt`; dedicated YouTube metadata and nonempty editor descriptions still take precedence. No new AI generation is required.
+
+ClipPublisher calls `process_due` itself on every poll (`run_forever`) and before each `--once` run, only when `YOUTUBE_SELECTION_MODE=instagram_top` (set by the profiles), `CLIPPER_TEST_MODE` is off and `CLIPPER_PUBLISH_ONLY` is not `instagram`. ClipScheduler only calls `prepare`. In that mode shared queue items are never uploaded to YouTube, even if a slot lists it; the default `shared` mode keeps the previous behavior. Replay errors are logged and never block the Instagram queue. Queue discovery only looks at run directories, so the plan/history files (and their temp/backup files) in `QUEUE_DIR` are ignored.
 
 ## Required config
 
@@ -74,6 +95,32 @@ python main.py --refresh-token
 ```
 
 This exchanges/persists a long-lived token into `TOKEN_STATE_FILE`. After that, normal publisher runs will auto-refresh before expiry.
+
+### Replacing a token (including newly granted permissions)
+
+From the repository root, select the account explicitly:
+
+```powershell
+python apps\ClipPublisher\main.py --refresh-token --n3on --token=TOKEN
+python apps\ClipPublisher\main.py --refresh-token --navaeh --token-prompt
+```
+
+`--token-prompt` reads the replacement without displaying it or putting it in shell history.
+Prefer it over `--token`, which can expose the credential through history/process arguments.
+Never paste credentials into chat or commit them. Both options require `--refresh-token`.
+
+Stop the affected pipeline before replacing credentials, then restart it after success to avoid
+concurrent token-state writes. The explicit replacement bypasses the old saved token and
+`AUTO_REFRESH_TOKEN`, validates its Meta app and validity, exchanges it for a long-lived token,
+validates the result, and atomically replaces only the selected profile's `TOKEN_STATE_FILE`.
+It requires `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET`. Failures before saving leave the old
+file intact. There is no need to edit token JSON or `.env` files for this operation.
+The command exits without starting the queue publisher, media server, or tunnel.
+
+Without either replacement option, `--refresh-token` retains the existing renewal behavior:
+saved token first, then `INSTAGRAM_ACCESS_TOKEN`. Refreshing does not grant new permissions;
+authorize them through Meta first and supply that newly authorized token. Verify required scopes
+and read-only Insights access separately. See `PRODUCTION_DEPLOYMENT.md` for server rotation.
 
 ### Recommended cloud media hosting (Lightsail + R2)
 

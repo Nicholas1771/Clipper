@@ -2,7 +2,9 @@
 
 import argparse
 import logging
+import os
 import sys
+from datetime import date
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -28,6 +30,15 @@ def configure_logging() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze sourced clips for KICK overlays and write SEO summaries before editing.")
     parser.add_argument("--once", action="store_true", help="Run one AI analysis pass and exit.")
+    parser.add_argument(
+        "--backfill-youtube",
+        metavar="SINCE",
+        type=date.fromisoformat,
+        help="Write missing YouTube title/description for archived Instagram posts published on/after SINCE (YYYY-MM-DD), then exit.",
+    )
+    for path in sorted((APP_ROOT.parent.parent / "profiles").glob("*.env")):
+        if not path.stem.endswith(".local"):
+            parser.add_argument(f"--{path.stem}", dest="profile", action="store_const", const=path.stem)
     return parser.parse_args()
 
 
@@ -35,8 +46,14 @@ def main() -> int:
     configure_logging()
     try:
         args = parse_args()
+        if getattr(args, "profile", None):
+            os.environ["CLIPPER_PROFILE"] = args.profile
         config = AppConfig.from_repo_root(APP_ROOT)
         service = ClipAIService(config)
+
+        if args.backfill_youtube:
+            service.backfill_youtube_metadata(since=args.backfill_youtube)
+            return 0
 
         if args.once:
             service.process_once()

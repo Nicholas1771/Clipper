@@ -27,6 +27,9 @@ class AppConfig:
     kick_overlay_bottom_y: float = 0.74
     watermark_opacity: float = 0.42
     watermark_size: float = 0.02
+    trim_start_seconds: float = 0.0
+    trim_end_seconds: float = 0.0
+    audio_pitch_scale: float = 1.0
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
@@ -72,6 +75,9 @@ class AppConfig:
             kick_overlay_bottom_y=_float_env("KICK_OVERLAY_BOTTOM_Y", 0.74, 0.0, 1.0),
             watermark_opacity=_float_env("WATERMARK_OPACITY", 0.42, 0.0, 1.0),
             watermark_size=_float_env("WATERMARK_SIZE", 0.02, 0.0, 1.0),
+            trim_start_seconds=_float_env("TRIM_START_SECONDS", 0.0, 0.0, 3600.0, "CLIP_TRIM_START_SECONDS"),
+            trim_end_seconds=_float_env("TRIM_END_SECONDS", 0.0, 0.0, 3600.0, "CLIP_TRIM_END_SECONDS"),
+            audio_pitch_scale=_float_env("AUDIO_PITCH_SCALE", 1.0, 0.5, 2.0),
         )
 
 
@@ -105,12 +111,13 @@ def _default_font_name() -> str:
     return "DejaVu Sans"
 
 
-def _float_env(name: str, default: float, low: float, high: float) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return max(low, min(high, value))
+def _float_env(name: str, default: float, low: float, high: float, *aliases: str) -> float:
+    for candidate in (name, *aliases):
+        raw = os.getenv(candidate, "").strip()
+        if raw:
+            try:
+                value = float(raw)
+                return max(low, min(high, value))
+            except ValueError:
+                pass
+    return default

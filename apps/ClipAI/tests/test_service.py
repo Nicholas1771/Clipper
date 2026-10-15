@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -30,19 +31,6 @@ class ClipAITests(unittest.TestCase):
             service._normalize_hashtags(["#FirstTag", "Sample", "firsttag", "Second Tag", "x"]),
         )
         self.assertEqual([], service._normalize_hashtags(None))
-
-    def test_parse_watermark_box_validates_and_normalizes(self) -> None:
-        service = ClipAIService(AppConfig(
-            queue_dir=Path("."), poll_interval_seconds=60, google_api_key="k",
-            gemini_model="m", timeout_seconds=30, timezone_name="America/New_York",
-        ))
-        self.assertEqual(
-            {"x": 0.4, "y": 0.49, "w": 0.2, "h": 0.03},
-            service._parse_watermark_box([490, 400, 520, 600]),
-        )
-        self.assertIsNone(service._parse_watermark_box([0, 0, 1000, 1000]))
-        self.assertIsNone(service._parse_watermark_box([500, 600, 500, 400]))
-        self.assertIsNone(service._parse_watermark_box("nope"))
 
     def test_process_once_writes_analysis_and_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -83,7 +71,10 @@ class ClipAITests(unittest.TestCase):
             with patch.object(
                 service,
                 "_analyze_visual",
-                return_value={"has_kick_overlay": False, "has_caption": True, "caption_position": "BOTTOM"},
+                return_value={
+                    "has_kick_overlay": False, "has_caption": True, "caption_position": "BOTTOM",
+                    "caption_bands": [{"top": 78, "bottom": 92}, {"top": 0.1, "bottom": 0.05}, {"top": 0.0, "bottom": 0.9}, "bad"],
+                },
             ), patch.object(
                 service,
                 "_analyze_clip_context",
@@ -104,6 +95,7 @@ class ClipAITests(unittest.TestCase):
             self.assertFalse(analysis["has_kick_overlay"])
             self.assertTrue(analysis["has_caption"])
             self.assertEqual("BOTTOM", analysis["caption_position"])
+            self.assertEqual([{"top": 0.05, "bottom": 0.1}, {"top": 0.78, "bottom": 0.92}], analysis["caption_bands"])
             self.assertFalse(analysis["context_sufficient"])
             self.assertEqual(
                 "First paragraph with context.\n\nSecond paragraph with context.\n\nThird paragraph with context.\n\n#yera",
@@ -158,6 +150,61 @@ class YouTubeDescriptionTests(unittest.TestCase):
             self.assertLessEqual(len(title), 100)
             self.assertTrue(title.endswith("word"))
             self.assertEqual("Sample clip", self.make_service(tmp)._youtube_title("  "))
+
+    def archived(self, queue: Path, name: str, *, when: str, status: str = "success", existing: bool = False) -> Path:
+        run = queue / "Archive" / name
+        for sub in ("source", "editor", "ai", "publisher"):
+            (run / sub).mkdir(parents=True)
+        (run / "source" / "m.json").write_text(json.dumps({"text": f"Clip {name} #n3on"}), encoding="utf-8")
+        (run / "ai" / "transcript.txt").write_text("hello", encoding="utf-8")
+        (run / "ai" / "analysis.json").write_text(json.dumps({"context_sufficient": True, "summary": "ig summary"}), encoding="utf-8")
+        (run / "publisher" / "publish_state.json").write_text(json.dumps(
+            {"phase": "published", "status": status, "result": {"id": "m"}, "updated_at": when}), encoding="utf-8")
+        if existing:
+            (run / "editor" / "youtube_description.txt").write_text("keep", encoding="utf-8")
+        return run
+
+    def test_backfill_writes_missing_metadata_for_recent_published_clips_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(tmp)
+            queue = Path(tmp)
+            new = self.archived(queue, "new", when="2026-10-14T12:00:00-04:00")
+            old = self.archived(queue, "old", when="2026-10-12T12:00:00-04:00")
+            failed = self.archived(queue, "failed", when="2026-10-14T12:00:00-04:00", status="error")
+            done = self.archived(queue, "done", when="2026-10-14T12:00:00-04:00", existing=True)
+            with patch.object(service, "_call_gemini", return_value={"text": "Fresh desc"}) as call:
+                self.assertEqual(1, service.backfill_youtube_metadata(since=date(2026, 10, 13)))
+            self.assertEqual(1, call.call_count)
+            self.assertEqual("YT Sample: Clip new | hello | yes", call.call_args.args[0])
+            self.assertEqual("Fresh desc", (new / "editor" / "youtube_description.txt").read_text(encoding="utf-8"))
+            self.assertEqual("Clip new", (new / "editor" / "youtube_title.txt").read_text(encoding="utf-8"))
+            self.assertEqual("keep", (done / "editor" / "youtube_description.txt").read_text(encoding="utf-8"))
+            for run in (old, failed):
+                self.assertFalse((run / "editor" / "youtube_description.txt").exists())
+
+    def test_instagram_top_mode_generates_youtube_files_without_youtube_slot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            prompts = Path(tmp) / "prompts"
+            prompts.mkdir()
+            (prompts / "youtube_description.txt").write_text("x", encoding="utf-8")
+            for mode, expected in (("instagram_top", True), ("shared", False)):
+                service = ClipAIService(AppConfig(
+                    queue_dir=Path(tmp), poll_interval_seconds=60, google_api_key="k", prompts_dir=prompts,
+                    gemini_model="m", timeout_seconds=30, timezone_name="America/New_York", youtube_selection_mode=mode,
+                ))
+                run_dir = Path(tmp) / f"run_{mode}"
+                (run_dir / "source").mkdir(parents=True)
+                (run_dir / "source" / "m.json").write_text("{}", encoding="utf-8")
+                (run_dir / "queue_state.json").write_text(json.dumps({"phase": "sourced"}), encoding="utf-8")
+                context = {"caption": "c", "transcript": "t", "context_sufficient": True, "hashtags": []}
+                with patch.object(service, "_ready_items", return_value=[run_dir]), \
+                     patch.object(service, "_analyze_visual", return_value={}), \
+                     patch.object(service, "_analyze_clip_context", return_value=context), \
+                     patch.object(service, "_generate_summary", return_value="s"), \
+                     patch("clipai.service.read_slot_platforms", return_value=["instagram"]), \
+                     patch.object(service, "_write_youtube_files", return_value="d") as write:
+                    service.process_once()
+                self.assertEqual(expected, write.called, mode)
 
 
 if __name__ == "__main__":

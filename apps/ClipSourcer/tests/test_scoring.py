@@ -21,7 +21,11 @@ from clipsourcer.config import AppConfig
 from clipsourcer.downloads import _download_all_video_files_for_test, download_video_file
 from clipsourcer.models import ClipCandidate
 from clipsourcer.scoring import has_minimum_views, matches_keyword, rank_candidates, viral_score
-from clipsourcer.service import ClipSourcerService
+from clipsourcer.service import (
+    ClipSourcerService,
+    _log_candidate_diagnostics,
+    _log_play_count_distribution,
+)
 from clipsourcer.storage import build_clip_base_path, save_seen_ids
 
 
@@ -63,6 +67,7 @@ def build_config(root: Path, **overrides: object) -> AppConfig:
         "source_hashtag": "sample",
         "source_profiles": [],
         "keyword_filter": "sample",
+        "candidate_cache_file": root / "data" / "candidate_cache.json",
         "poll_interval_minutes": 15,
         "lookback_hours": 4,
         "results_per_page": 25,
@@ -131,6 +136,150 @@ class ScoringTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_failed_cached_download_is_removed_without_marking_seen(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = build_config(Path(temp_dir))
+            item = {
+                "id": "failed",
+                "createTimeISO": datetime.now(timezone.utc).isoformat(),
+                "text": "sample",
+                "playCount": 150_000,
+            }
+            service = ClipSourcerService(config)
+            service._save_candidate_cache([ClipCandidate.from_apify_item(item)])
+            with patch("clipsourcer.service.download_video_file", side_effect=RuntimeError("download failed")):
+                outcome = service.run_once(bypass_schedule=True)
+            self.assertEqual("no_match", outcome.status)
+            self.assertFalse(config.state_file.exists())
+            self.assertEqual([], json.loads(config.candidate_cache_file.read_text())["items"])
+            self.assertEqual({"failed"}, service._load_attempted_candidates())
+
+            restarted = ClipSourcerService(config, fetch_items=lambda _config: [item])
+            with patch("clipsourcer.service.download_video_file") as download:
+                outcome = restarted.run_once(bypass_schedule=True)
+            self.assertEqual("no_match", outcome.status)
+            download.assert_not_called()
+
+    def test_queue_write_failure_does_not_leave_candidate_cached_or_seen(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = build_config(Path(temp_dir))
+            item = {
+                "id": "queue-failed",
+                "createTimeISO": datetime.now(timezone.utc).isoformat(),
+                "text": "sample",
+            }
+            service = ClipSourcerService(config, fetch_items=lambda _config: [item])
+            with patch("clipsourcer.service.write_queue_state", side_effect=OSError("disk failure")):
+                outcome = service.run_once(bypass_schedule=True)
+            self.assertEqual("error", outcome.status)
+            self.assertFalse(config.state_file.exists())
+            self.assertEqual([], json.loads(config.candidate_cache_file.read_text())["items"])
+            self.assertEqual({"queue-failed"}, service._load_attempted_candidates())
+
+    def test_cache_logs_each_candidate_only_after_successful_save(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            service = ClipSourcerService(build_config(Path(temp_dir)))
+            candidates = [
+                build_candidate("first", hours_ago=1, text="sample", plays=150_000),
+                build_candidate("second", hours_ago=1, text="sample", plays=200_000),
+            ]
+
+            with self.assertLogs("clipsourcer.service", level="INFO") as captured:
+                service._save_candidate_cache(candidates)
+
+            self.assertIn("Candidate cache saved: size=2 clip(s).", captured.output[0])
+            self.assertEqual(3, len(captured.output))
+            for candidate, message in zip(candidates, captured.output[1:]):
+                self.assertIn(
+                    f"Saved candidate to cache: id={candidate.clip_id} author=example views={candidate.plays}",
+                    message,
+                )
+                self.assertIn("viral_score=", message)
+                self.assertIn(f"url={candidate.url}", message)
+
+            with patch.object(Path, "replace", side_effect=OSError("cache write failed")):
+                with self.assertLogs("clipsourcer.service", level="INFO") as failed:
+                    service._save_candidate_cache(candidates)
+
+            self.assertTrue(any("Could not persist candidate cache" in message for message in failed.output))
+            self.assertFalse(any("Saved candidate to cache:" in message for message in failed.output))
+
+    def test_candidate_diagnostics_log_selection_and_rejection_details(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = build_candidate(
+            "eligible",
+            hours_ago=1,
+            text="sample clip",
+            plays=150_000,
+            likes=1200,
+            comments=80,
+            shares=40,
+            saves=20,
+        )
+        seen = build_candidate(
+            "seen",
+            hours_ago=1,
+            text="sample clip",
+            plays=200_000,
+        )
+        below_threshold = build_candidate(
+            "below-threshold",
+            hours_ago=1,
+            text="sample clip",
+            plays=99_999,
+        )
+
+        with self.assertLogs("clipsourcer.service", level="DEBUG") as captured:
+            _log_candidate_diagnostics(
+                [eligible, seen, below_threshold],
+                origin="Apify",
+                now=now,
+                lookback_hours=4,
+                keyword="sample",
+                minimum_view_count=100_000,
+                seen_ids={"seen"},
+                ranked=[(eligible, 20.0), (seen, 10.0)],
+                unseen_ranked=[(eligible, 20.0)],
+            )
+
+        self.assertEqual(3, len(captured.output))
+        self.assertIn(
+            "Apify candidate: id=eligible author=example views=150000 likes=1200 comments=80 "
+            "shares=40 saves=20",
+            captured.output[0],
+        )
+        self.assertIn("eligible_rank=1 selection_rank=1", captured.output[0])
+        self.assertIn("meets_min_views=True (minimum=100000) seen=False rejected_by=none", captured.output[0])
+        self.assertIn("url=https://www.tiktok.com/@example/video/eligible", captured.output[0])
+        self.assertIn("eligible_rank=2 selection_rank=-", captured.output[1])
+        self.assertIn("meets_min_views=True (minimum=100000) seen=True rejected_by=already_seen", captured.output[1])
+        self.assertIn("eligible_rank=- selection_rank=-", captured.output[2])
+        self.assertIn(
+            "meets_min_views=False (minimum=100000) seen=False rejected_by=below_min_views",
+            captured.output[2],
+        )
+
+    def test_play_count_distribution_is_logged_in_ranges(self) -> None:
+        candidates = [
+            build_candidate("1", hours_ago=1, text="sample", plays=0),
+            build_candidate("2", hours_ago=1, text="sample", plays=999),
+            build_candidate("3", hours_ago=1, text="sample", plays=1_000),
+            build_candidate("4", hours_ago=1, text="sample", plays=10_000),
+            build_candidate("5", hours_ago=1, text="sample", plays=100_000),
+            build_candidate("6", hours_ago=1, text="sample", plays=1_000_000),
+            build_candidate("7", hours_ago=1, text="sample", plays=10_000_000),
+        ]
+
+        with self.assertLogs("clipsourcer.service", level="INFO") as captured:
+            _log_play_count_distribution(candidates)
+
+        self.assertIn(
+            "Apify result play-count distribution (total=7): "
+            "<1,000: 2, 1,000-9,999: 1, 10,000-99,999: 1, "
+            "100,000-999,999: 1, 1,000,000-9,999,999: 1, >=10,000,000: 1",
+            captured.output[0],
+        )
+
     def test_scheduled_time_targets_before_posting_window_start(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -269,15 +418,46 @@ class ServiceTests(unittest.TestCase):
                 },
             ]
 
-            service = ClipSourcerService(config, fetch_items=lambda _config: items)
+            fetch_count = 0
+
+            def fetch_items(_config: AppConfig) -> list[dict]:
+                nonlocal fetch_count
+                fetch_count += 1
+                return items
+
+            service = ClipSourcerService(config, fetch_items=fetch_items)
             with patch.object(service, "_can_source_now", return_value=(True, None)):
-                outcome = service.run_once()
+                with self.assertLogs("clipsourcer.service", level="INFO") as fresh_logs:
+                    outcome = service.run_once()
+
+            self.assertTrue(any("Candidate cache size at sourcing start: 0" in line for line in fresh_logs.output))
+            self.assertTrue(any("Candidate source: Apify;" in line for line in fresh_logs.output))
+            self.assertTrue(any("Candidate cache saved: size=1 clip(s)." in line for line in fresh_logs.output))
 
             self.assertEqual("sourced", outcome.status)
             assert outcome.result is not None
             self.assertTrue(outcome.result.manifest_path.exists())
             self.assertIn("winner", outcome.result.manifest_path.read_text(encoding="utf-8"))
             self.assertIsNone(outcome.result.downloaded_video_path)
+            self.assertFalse(config.state_file.exists())
+            self.assertEqual({"winner"}, service._load_attempted_candidates())
+
+            restarted_service = ClipSourcerService(config, fetch_items=fetch_items)
+            with self.assertLogs("clipsourcer.service", level="INFO") as cache_logs:
+                second = restarted_service.run_once(bypass_schedule=True)
+            self.assertTrue(any("Candidate cache size at sourcing start: 1" in line for line in cache_logs.output))
+            self.assertTrue(any("from the persistent cache; skipping Apify fetch." in line for line in cache_logs.output))
+            self.assertTrue(any("Candidate cache saved: size=0 clip(s)." in line for line in cache_logs.output))
+            self.assertTrue(any(
+                "Using candidate from cache: id=runner-up author=runner views=30000 viral_score=" in line
+                for line in cache_logs.output
+            ))
+            self.assertFalse(any("Saved candidate to cache:" in line for line in cache_logs.output))
+            self.assertFalse(any("Candidate cache saved: size=1 clip(s)." in line for line in cache_logs.output))
+            self.assertEqual("sourced", second.status)
+            assert second.result is not None
+            self.assertIn("runner-up", second.result.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(1, fetch_count)
 
     def test_run_once_downloads_authorized_video_when_media_url_is_present(self) -> None:
         with TemporaryDirectory() as temp_dir:

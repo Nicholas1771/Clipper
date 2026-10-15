@@ -1,0 +1,15 @@
+We will add a solid, opaque, full-width branding strip to this vertical video. It will completely hide whatever is underneath it for the whole clip.
+
+The image shows __FRAME_COUNT__ frames from the same clip side by side. On every frame, the same numbered magenta boxes (1 to __CANDIDATE_COUNT__) mark the possible positions of the strip.
+
+For EVERY numbered box, look at what is inside that box in ALL of the frames and report:
+- covers: a short description of what the strip would hide at that position (for example "subtitle text KEEP", "eyes and nose", "hoodie and hands", "plain wall").
+- clear: false if, in ANY frame, the box touches any of:
+  - on-screen caption, subtitle or title text that was edited on top of the video (including any part of a line of it)
+  - a person's face from the eyebrows down to the chin
+  - an on-screen graphic added on top of the video: logo bug, scoreboard, chat, picture-in-picture, stream overlay
+  Otherwise clear is true. These are all CLEAR: clothing (including logos or words printed on clothing), hair,
+  neck, chest, hands, arms, microphones, products, furniture, walls, background, black letterbox bars, and any text that
+  physically exists in the scene (posters, signs, shirt prints, microphone brand names).
+
+Judge each box independently. Return only JSON with schema {"boxes": [{"number": integer, "covers": string, "clear": boolean}], "confidence": number}.

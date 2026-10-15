@@ -15,6 +15,7 @@ class AppConfig:
     source_hashtag: str
     source_profiles: list[str]
     keyword_filter: str
+    candidate_cache_file: Path
     poll_interval_minutes: float
     lookback_hours: int
     results_per_page: int
@@ -61,21 +62,27 @@ class AppConfig:
         state_raw = os.getenv("STATE_FILE", "data/state.json").strip()
         history_raw = os.getenv("SOURCE_HISTORY_FILE", "data/source_history.json").strip()
         schedule_raw = os.getenv("SOURCE_SCHEDULE_FILE", "data/source_schedule.json").strip()
+        cache_raw = os.getenv("CANDIDATE_CACHE_FILE", "").strip() or "data/candidate_cache.json"
         if os.name != "nt" and looks_like_windows_path(state_raw):
             state_raw = "data/state.json"
         if os.name != "nt" and looks_like_windows_path(history_raw):
             history_raw = "data/source_history.json"
         if os.name != "nt" and looks_like_windows_path(schedule_raw):
             schedule_raw = "data/source_schedule.json"
+        if os.name != "nt" and looks_like_windows_path(cache_raw):
+            cache_raw = "data/candidate_cache.json"
         state_file = Path(state_raw).expanduser()
         source_history_file = Path(history_raw).expanduser()
         source_schedule_file = Path(schedule_raw).expanduser()
+        candidate_cache_file = Path(cache_raw).expanduser()
         if not state_file.is_absolute():
             state_file = root_dir / state_file
         if not source_history_file.is_absolute():
             source_history_file = root_dir / source_history_file
         if not source_schedule_file.is_absolute():
             source_schedule_file = root_dir / source_schedule_file
+        if not candidate_cache_file.is_absolute():
+            candidate_cache_file = root_dir / candidate_cache_file
 
         return cls(
             apify_token=apify_token,
@@ -84,6 +91,7 @@ class AppConfig:
             source_hashtag=os.getenv("SOURCE_HASHTAG", "").strip().lstrip("#"),
             source_profiles=source_profiles,
             keyword_filter=os.getenv("KEYWORD_FILTER", "").strip(),
+            candidate_cache_file=candidate_cache_file,
             poll_interval_minutes=float(os.getenv("POLL_INTERVAL_MINUTES", "60")),
             lookback_hours=int(os.getenv("LOOKBACK_HOURS", "4")),
             results_per_page=int(os.getenv("RESULTS_PER_PAGE", "25")),

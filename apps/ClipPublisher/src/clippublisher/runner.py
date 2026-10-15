@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +17,24 @@ from common.alerts import send_email_alert, send_failure_alert
 from clippublisher.instagram_client import publish_to_instagram
 from clippublisher.queue import claim_item, discover_queue_items, is_item_ready
 from clippublisher.youtube_client import is_configured as youtube_is_configured, publish_to_youtube
-from common.platforms import INSTAGRAM, PLATFORM_LABELS, YOUTUBE, read_slot_platforms
+from common.env import is_test_mode, parse_bool
+from common.platforms import INSTAGRAM, PLATFORM_LABELS, YOUTUBE, publish_only, read_slot_platforms
 from clippublisher.token_manager import resolve_publish_access_token
 
 
 logger = logging.getLogger(__name__)
+
+YOUTUBE_SELECTION_MODE_ENV = "YOUTUBE_SELECTION_MODE"
+INSTAGRAM_TOP = "instagram_top"
+
+
+def youtube_selection_mode() -> str:
+    return os.getenv(YOUTUBE_SELECTION_MODE_ENV, "shared").strip().lower() or "shared"
+
+
+def youtube_replay_enabled() -> bool:
+    """Scheduled replay uploads run only in instagram_top mode, outside test mode, unless --publish instagram."""
+    return youtube_selection_mode() == INSTAGRAM_TOP and not is_test_mode() and publish_only() != INSTAGRAM
 
 
 def load_json(path: Path) -> Any:
@@ -100,6 +115,29 @@ def send_posted_alert(*, clip_id: str, author_handle: str, platform: str = INSTA
 class QueuePublisherRunner:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._youtube_replay: Any = None
+
+    def _shared_slot_platforms(self) -> list[str]:
+        platforms = read_slot_platforms(self.config.queue_dir)
+        if youtube_selection_mode() == INSTAGRAM_TOP and YOUTUBE in platforms:
+            # YouTube is fed only by the separate replay plan in this mode, never by the shared queue.
+            logger.info("YOUTUBE_SELECTION_MODE=instagram_top: shared queue item will not be uploaded to YouTube.")
+            platforms = [platform for platform in platforms if platform != YOUTUBE]
+        return platforms
+
+    def process_youtube_replay(self) -> bool:
+        """Upload at most one due clip from the YouTube replay plan. Never raises."""
+        if not youtube_replay_enabled():
+            return False
+        try:
+            if self._youtube_replay is None:
+                from clippublisher.youtube_replay import YouTubeReplay
+
+                self._youtube_replay = YouTubeReplay(self.config)
+            return bool(self._youtube_replay.process_due(datetime.now(ZoneInfo(self.config.timezone_name))))
+        except Exception:
+            logger.exception("YouTube replay processing failed; the shared Instagram queue continues unchanged.")
+            return False
 
     def _sourcer_seen_ids_path(self) -> Path:
         state_raw = os.getenv("STATE_FILE", "data/state.json").strip()
@@ -124,6 +162,25 @@ class QueuePublisherRunner:
         payload["updated_at"] = datetime.now(ZoneInfo(self.config.timezone_name)).isoformat()
         save_json(state_file, payload)
         logger.info("Recorded successful published clip ID %s in seen history at %s.", clip_id, state_file)
+        self._sync_seen_to_production()
+
+    def _sync_seen_to_production(self) -> None:
+        """Workstation only (SYNC_SEEN_TO_PRODUCTION=true): append local seen IDs to production. Never raises."""
+        if not parse_bool(os.getenv("SYNC_SEEN_TO_PRODUCTION"), strict=False):
+            return
+        profile = os.getenv("CLIPPER_PROFILE", "").strip().lower()
+        script = Path(__file__).resolve().parents[4] / "sync_seen_ids.py"
+        manual = f"python sync_seen_ids.py --{profile}"
+        try:
+            completed = subprocess.run([sys.executable, str(script), f"--{profile}"], capture_output=True, text=True, timeout=90)
+        except Exception as exc:
+            logger.warning("Could not sync seen IDs to production (%s). Run `%s` manually.", type(exc).__name__, manual)
+            return
+        output = (completed.stdout or completed.stderr).strip()
+        if completed.returncode == 0:
+            logger.info("Synced seen IDs to production: %s", output)
+        else:
+            logger.warning("Seen-ID sync to production failed: %s Run `%s` manually.", output, manual)
 
     def _archive_completed_item(self, run_dir: Path) -> Path:
         archive_dir = self.config.queue_dir / "Archive"
@@ -155,7 +212,6 @@ class QueuePublisherRunner:
                 }, indent=2),
                 encoding="utf-8",
             )
-            self._record_seen_id(claimed.clip_id)
             archive_dir = self.config.queue_dir / "Archive"
             archive_dir.mkdir(parents=True, exist_ok=True)
             destination = archive_dir / f"{run_dir.name}_failed"
@@ -188,6 +244,7 @@ class QueuePublisherRunner:
     def _publish_claimed(self, claimed: Any, platforms: list[str]) -> None:
         """Attempt each assigned platform once, independently. Raises only if every attempted platform failed."""
         results: dict[str, Any] = {}
+        published_at: dict[str, str] = {}
         failures: dict[str, Exception] = {}
         skipped: list[str] = []
         for platform in platforms:
@@ -203,6 +260,7 @@ class QueuePublisherRunner:
                     results[platform] = publish_to_youtube(self.config, claimed)
                 else:
                     continue
+                published_at[platform] = datetime.now(ZoneInfo(self.config.timezone_name)).isoformat()
                 logger.info("%s publish response for %s: %s", PLATFORM_LABELS.get(platform, platform), claimed.run_dir.name, results[platform])
             except Exception as error:
                 failures[platform] = error
@@ -233,11 +291,13 @@ class QueuePublisherRunner:
                 "result": results.get(INSTAGRAM) if len(results) == 1 and INSTAGRAM in results else results,
                 "errors": {name: str(error) for name, error in failures.items()},
                 "skipped": skipped,
+                "published_at": published_at,
                 "updated_at": datetime.now(ZoneInfo(self.config.timezone_name)).isoformat(),
             }, indent=2),
             encoding="utf-8",
         )
         if results:
+            self._record_seen_id(claimed.clip_id)
             for platform, result in results.items():
                 send_posted_alert(
                     clip_id=claimed.clip_id,
@@ -248,11 +308,11 @@ class QueuePublisherRunner:
                     subject=alert_subject(self.config, claimed.clip_id, "Success"),
                     title=original_title(claimed.manifest_path, claimed.caption),
                 )
-            self._record_seen_id(claimed.clip_id)
         self._archive_completed_item(claimed.run_dir)
 
     def process_one_ready_item(self, *, bypass_schedule: bool = False) -> bool:
         del bypass_schedule
+        self.process_youtube_replay()
         ready_items = []
         for item in discover_queue_items(self.config):
             if is_item_ready(item.run_dir, self.config.ready_stability_seconds):
@@ -264,7 +324,7 @@ class QueuePublisherRunner:
 
         item = ready_items[0]
         # Read before claiming: claiming marks this slot done and the scheduler may overwrite the state afterwards.
-        platforms = read_slot_platforms(self.config.queue_dir)
+        platforms = self._shared_slot_platforms()
         claimed = claim_item(self.config, item)
         logger.info("Claimed ready queue item %s for publishing to %s.", claimed.run_dir.name, ", ".join(platforms))
         self._publish_claimed(claimed, platforms)
@@ -274,6 +334,7 @@ class QueuePublisherRunner:
         logger.info("ClipPublisher is watching %s for edited queue items.", self.config.queue_dir)
         while True:
             try:
+                self.process_youtube_replay()
                 ready_items = []
                 for item in discover_queue_items(self.config):
                     if is_item_ready(item.run_dir, self.config.ready_stability_seconds):
@@ -286,7 +347,7 @@ class QueuePublisherRunner:
                     continue
 
                 item = ready_items[0]
-                platforms = read_slot_platforms(self.config.queue_dir)
+                platforms = self._shared_slot_platforms()
                 claimed = claim_item(self.config, item)
                 logger.info("Found ready queue item %s. Claiming and publishing to %s immediately.", claimed.run_dir.name, ", ".join(platforms))
                 try:

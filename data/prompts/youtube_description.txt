@@ -4,6 +4,7 @@ Source caption: "__CAPTION__"
 Transcript of the clip: "__TRANSCRIPT__"
 
 Rules:
+- If the source caption is valid (not empty, null, too short, or just hashtags, couple words), simply paraphrase it in a catchy way in the same style.
 - Plain text only, no markdown or headers.
 - Add 1-2 emojis, with no spaces, directly at the end of the caption to enhance engagement.
 - Capitalize a few key words in the caption to draw attention to important points.
