@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -12,8 +13,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from common.alerts import send_email_alert
-from common.env import _find_repo_root, looks_like_windows_path
+from common.env import _find_repo_root, available_accounts, is_test_mode, looks_like_windows_path
 from common.platforms import INSTAGRAM, PLATFORM_LABELS, YOUTUBE
+from common.reporting import ApifyUsage, apify_usage, posts_for_day
+from common.creators import configured_creators
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,11 @@ class ScheduleSlot:
     platforms: str
     is_remaining: bool = True
     is_overdue: bool = False
+    creator: str = ""
+
+    @property
+    def label(self) -> str:
+        return f"{self.account} | {self.creator}" if self.creator else self.account
 
 
 def _parse_simple_env(path: Path) -> dict[str, str]:
@@ -73,21 +81,17 @@ def _parse_simple_env(path: Path) -> dict[str, str]:
 
 
 def discover_profile_configs(repo_root: Path) -> list[ProfileConfig]:
-    profiles_dir = repo_root / "profiles"
+    profiles_dir = repo_root / "accounts"
     if not profiles_dir.exists():
         return []
     root_env = _parse_simple_env(repo_root / ".env")
+    root_env.update(_parse_simple_env(repo_root / "apps" / "ClipPublisher" / ".env"))
+    root_env.update(_parse_simple_env(repo_root / "apps" / "ClipScheduler" / ".env"))
     configs: list[ProfileConfig] = []
 
-    for env_file in sorted(profiles_dir.glob("*.env")):
-        if env_file.name.endswith(".local.env") or env_file.name.endswith(".example"):
-            continue
-        profile_name = env_file.stem.lower()
+    for profile_name in available_accounts(repo_root):
+        env_file = profiles_dir / f"{profile_name}.env"
         p_env = _parse_simple_env(env_file)
-        local_file = profiles_dir / f"{profile_name}.local.env"
-        if local_file.exists():
-            p_env.update(_parse_simple_env(local_file))
-
         merged: dict[str, str] = dict(root_env)
         merged.update(p_env)
 
@@ -113,14 +117,9 @@ def discover_profile_configs(repo_root: Path) -> list[ProfileConfig]:
         if not yt_token_path.is_absolute():
             yt_token_path = repo_root / yt_token_path
 
-        try:
-            ig_posts = int(merged.get("INSTAGRAM_POSTS_PER_DAY") or merged.get("POSTS_PER_DAY") or "5")
-        except ValueError:
-            ig_posts = 5
-        try:
-            yt_posts = int(merged.get("YOUTUBE_POSTS_PER_DAY") or "0")
-        except ValueError:
-            yt_posts = 0
+        creators = configured_creators(repo_root, merged)
+        ig_posts = sum(creator.instagram_posts_per_day for creator in creators)
+        yt_posts = sum(creator.youtube_posts_per_day for creator in creators)
         try:
             start_hour = int(merged.get("SCHEDULE_START_HOUR") or "8")
         except ValueError:
@@ -242,6 +241,7 @@ def collect_schedule_slots(
 
         raw_slots = data.get("slots") or []
         raw_platforms = data.get("platforms") or []
+        raw_creators = data.get("creator_names") or []
         next_index = data.get("next_index")
         next_index = next_index if isinstance(next_index, int) else 0
 
@@ -262,6 +262,7 @@ def collect_schedule_slots(
                     platforms=plat_label,
                     is_remaining=is_remaining,
                     is_overdue=is_overdue,
+                    creator=str(raw_creators[idx]) if idx < len(raw_creators) else "",
                 )
             )
 
@@ -280,6 +281,7 @@ def collect_schedule_slots(
                             platforms="YouTube",
                             is_remaining=pending,
                             is_overdue=pending and slot_time <= now,
+                            creator=str(entry.get("creator_name") or ""),
                         ))
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 logger.warning("Could not read YouTube schedule for account %s.", profile.account_name, exc_info=True)
@@ -294,6 +296,7 @@ def collect_schedule_slots(
         if fb_account not in seen_accounts or not all_slots:
             fb_slots = getattr(fallback_plan, "slots", [])
             fb_platforms = getattr(fallback_plan, "platforms", [])
+            fb_creators = getattr(fallback_plan, "creator_names", [])
             fb_next_index = getattr(fallback_plan, "next_index", 0)
             for idx, slot_time in enumerate(fb_slots):
                 plat_list = fb_platforms[idx] if idx < len(fb_platforms) and isinstance(fb_platforms[idx], list) else ["instagram"]
@@ -307,6 +310,7 @@ def collect_schedule_slots(
                         platforms=plat_label,
                         is_remaining=is_remaining,
                         is_overdue=is_overdue,
+                        creator=str(fb_creators[idx]) if idx < len(fb_creators) else "",
                     )
                 )
 
@@ -315,9 +319,12 @@ def collect_schedule_slots(
         immediate_slot = ScheduleSlot(
             time=immediate,
             account=account_name,
-            platforms="Instagram" if getattr(fallback_config, "youtube_selection_mode", "shared") == "instagram_top" else "Instagram, YouTube",
+            platforms=format_platforms_label(getattr(fallback_config, "immediate_platforms", []))
+            if getattr(fallback_config, "immediate_platforms", None)
+            else "Instagram" if getattr(fallback_config, "youtube_selection_mode", "shared") == "instagram_top" else "Instagram, YouTube",
             is_remaining=True,
             is_overdue=False,
+            creator=getattr(fallback_config, "immediate_creator_name", ""),
         )
 
     all_slots.sort(key=lambda s: s.time)
@@ -347,11 +354,11 @@ def build_started_alert_body(
     lines.append("")
     lines.append("Remaining Schedule:")
     if immediate_slot is not None:
-        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.account} | {immediate_slot.platforms}")
+        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.label} | {immediate_slot.platforms}")
     if remaining_slots:
         for idx, slot in enumerate(remaining_slots, 1):
             overdue_str = " (overdue, runs on startup)" if slot.is_overdue else ""
-            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.account} | {slot.platforms}{overdue_str}")
+            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.label} | {slot.platforms}{overdue_str}")
     else:
         lines.append("  No runs left in today's window.")
     return "\n".join(lines) + "\n"
@@ -372,10 +379,10 @@ def build_schedule_alert_body(
         "Planned Schedule:",
     ]
     if immediate_slot is not None:
-        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.account} | {immediate_slot.platforms}")
+        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.label} | {immediate_slot.platforms}")
     if all_slots:
         for idx, slot in enumerate(all_slots, 1):
-            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.account} | {slot.platforms}")
+            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.label} | {slot.platforms}")
     else:
         lines.append("  No runs left in today's window.")
     return "\n".join(lines) + "\n"
@@ -451,53 +458,16 @@ def _write_coordinator(path: Path, data: dict) -> None:
 
 
 STARTUP_COOLDOWN_SECONDS = 180  # 3 minutes
+ALERT_LOCK_TIMEOUT_SECONDS = 120
 
 
-def send_consolidated_started_alert(
-    repo_root: Path,
-    now: datetime,
-    fallback_plan: object | None = None,
-    fallback_config: object | None = None,
-    immediate: datetime | None = None,
-    send_alert_fn: object | None = None,
-) -> bool:
-    if os.getenv("CLIPPER_TEST_MODE"):
-        return False
+def _slots_fingerprint(slots: list[ScheduleSlot]) -> str:
+    rows = sorted(f"{slot.time.isoformat()}|{slot.account}|{slot.platforms}" for slot in slots)
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
-    is_testing = "unittest" in sys.modules
-    coordinator_file, lock_file = _coordinator_paths(repo_root)
 
-    # 1. Under cross-process lock: check and atomically claim
-    with file_lock(lock_file):
-        data = _read_coordinator(coordinator_file)
-        last_started = float(data.get("last_started_at", 0))
-        if not is_testing and (time.time() - last_started < STARTUP_COOLDOWN_SECONDS):
-            logger.info(
-                "Startup alert already claimed/sent %s seconds ago; skipping duplicate.",
-                int(time.time() - last_started),
-            )
-            return False
-
-        # Claim immediately under lock so concurrent service sees it already claimed
-        data["last_started_at"] = time.time()
-        data["last_started_date"] = now.date().isoformat()
-        _write_coordinator(coordinator_file, data)
-
-    # 2. Wait up to 30 seconds for every profile to write today's plans (including YouTube replay plans) to disk
-    if not is_testing:
-        _wait_for_profile_plans(repo_root, now.date())
-
-    # 3. Gather status for all profiles
+def _alert_settings(repo_root: Path, fallback_config: object | None) -> tuple[list[ProfileConfig], str, int, int]:
     profiles = discover_profile_configs(repo_root)
-    status_map: dict[str, dict[str, str]] = {}
-    if profiles:
-        for p in profiles:
-            status_map[p.account_name] = check_platform_status(p)
-    else:
-        account_name = getattr(fallback_config, "account_name", "") or os.getenv("ACCOUNT_NAME", "") or "Clipper"
-        status_map[account_name] = {"Instagram": "OK", "YouTube": "OK"}
-
-    today = now.date()
     tz_name = (
         getattr(fallback_config, "timezone_name", "")
         or (profiles[0].timezone_name if profiles else "America/New_York")
@@ -512,29 +482,114 @@ def send_consolidated_started_alert(
         if fallback_config is not None
         else (profiles[0].schedule_end_hour if profiles else 23)
     )
+    return profiles, tz_name, start_hour, end_hour
 
-    all_slots, remaining_slots, immediate_slot = collect_schedule_slots(
-        repo_root, today, now, fallback_plan=fallback_plan, fallback_config=fallback_config, immediate=immediate
-    )
 
-    body = build_started_alert_body(
-        profiles_status=status_map,
-        remaining_slots=remaining_slots,
-        today=today,
-        tz_name=tz_name,
-        start_hour=start_hour,
-        end_hour=end_hour,
-        immediate_slot=immediate_slot,
-    )
-    subject = f"Started - {today.strftime('%Y%m%d')}"
+def _send_coordinated_plan_alert(
+    kind: str,
+    repo_root: Path,
+    now: datetime,
+    fallback_plan: object | None,
+    fallback_config: object | None,
+    immediate: datetime | None,
+    send_alert_fn: object | None,
+) -> bool:
+    if os.getenv("CLIPPER_TEST_MODE"):
+        return False
 
-    sender = send_alert_fn or send_email_alert
-    return sender(
-        app_name="ClipScheduler",
-        subject=subject,
-        body=body,
-        include_platform=False,
-        include_account=False,
+    is_testing = "unittest" in sys.modules
+    coordinator_file, lock_file = _coordinator_paths(repo_root)
+    today = now.date()
+
+    # Hold the lock through delivery so a concurrently starting profile waits, then sees the
+    # recorded send. State is only recorded after a successful send so failures are retried.
+    with file_lock(lock_file, timeout_seconds=ALERT_LOCK_TIMEOUT_SECONDS):
+        if not is_testing:
+            _wait_for_profile_plans(repo_root, today)
+
+        all_slots, remaining_slots, immediate_slot = collect_schedule_slots(
+            repo_root, today, now, fallback_plan=fallback_plan, fallback_config=fallback_config, immediate=immediate
+        )
+        fingerprint = _slots_fingerprint(all_slots)
+        data = {} if is_testing else _read_coordinator(coordinator_file)
+        if kind == "started":
+            elapsed = time.time() - float(data.get("last_started_at", 0) or 0)
+            if (
+                data.get("last_started_fingerprint") == fingerprint
+                and data.get("last_started_date") == today.isoformat()
+                and 0 <= elapsed < STARTUP_COOLDOWN_SECONDS
+            ):
+                logger.info("Startup alert for this schedule already sent %s seconds ago; skipping duplicate.", int(elapsed))
+                return False
+        elif (
+            data.get("last_schedule_date") == today.isoformat()
+            and data.get("last_schedule_fingerprint") == fingerprint
+        ):
+            logger.info("Schedule alert for this schedule already sent for %s; skipping duplicate.", today.isoformat())
+            return False
+
+        profiles, tz_name, start_hour, end_hour = _alert_settings(repo_root, fallback_config)
+        if kind == "started":
+            status_map: dict[str, dict[str, str]] = {}
+            if profiles:
+                for p in profiles:
+                    status_map[p.account_name] = check_platform_status(p)
+            else:
+                account_name = getattr(fallback_config, "account_name", "") or os.getenv("ACCOUNT_NAME", "") or "Clipper"
+                status_map[account_name] = {"Instagram": "OK", "YouTube": "OK"}
+            body = build_started_alert_body(
+                profiles_status=status_map,
+                remaining_slots=remaining_slots,
+                today=today,
+                tz_name=tz_name,
+                start_hour=start_hour,
+                end_hour=end_hour,
+                immediate_slot=immediate_slot,
+            )
+            subject = f"Started - {today.strftime('%Y%m%d')}"
+        else:
+            body = build_schedule_alert_body(
+                all_slots=all_slots,
+                today=today,
+                tz_name=tz_name,
+                start_hour=start_hour,
+                end_hour=end_hour,
+                immediate_slot=immediate_slot,
+            )
+            subject = f"Schedule - {today.strftime('%Y%m%d')}"
+
+        sender = send_alert_fn or send_email_alert
+        if not sender(
+            app_name="ClipScheduler",
+            subject=subject,
+            body=body,
+            include_platform=False,
+            include_account=False,
+        ):
+            logger.warning("%s alert email was not delivered; it will be retried on the next attempt.", kind.capitalize())
+            return False
+        if is_testing:
+            return True
+
+        data = _read_coordinator(coordinator_file)
+        prefix = "last_started" if kind == "started" else "last_schedule"
+        data[f"{prefix}_at"] = time.time()
+        data[f"{prefix}_date"] = today.isoformat()
+        data[f"{prefix}_fingerprint"] = fingerprint
+        _write_coordinator(coordinator_file, data)
+        return True
+
+
+def send_consolidated_started_alert(
+    repo_root: Path,
+    now: datetime,
+    fallback_plan: object | None = None,
+    fallback_config: object | None = None,
+    immediate: datetime | None = None,
+    send_alert_fn: object | None = None,
+) -> bool:
+    return _send_coordinated_plan_alert(
+        "started", repo_root, now, fallback_plan, fallback_config, immediate, send_alert_fn
     )
 
 
@@ -546,64 +601,106 @@ def send_consolidated_schedule_alert(
     immediate: datetime | None = None,
     send_alert_fn: object | None = None,
 ) -> bool:
-    if os.getenv("CLIPPER_TEST_MODE"):
-        return False
+    return _send_coordinated_plan_alert(
+        "schedule", repo_root, now, fallback_plan, fallback_config, immediate, send_alert_fn
+    )
 
-    is_testing = "unittest" in sys.modules
-    coordinator_file, lock_file = _coordinator_paths(repo_root)
+
+def build_daily_report_body(repo_root: Path, now: datetime, fallback_config: object) -> str:
     today = now.date()
-
-    # 1. Under cross-process lock: check and atomically claim for today
-    with file_lock(lock_file):
-        data = _read_coordinator(coordinator_file)
-        if not is_testing and data.get("last_schedule_date") == today.isoformat():
-            logger.info("Schedule alert already claimed/sent for %s; skipping duplicate.", today.isoformat())
-            return False
-
-        # Claim immediately under lock so concurrent service rolls over and skips
-        data["last_schedule_date"] = today.isoformat()
-        data["last_schedule_at"] = time.time()
-        _write_coordinator(coordinator_file, data)
-
-    # 2. Wait up to 30 seconds for every profile to write today's plans (including YouTube replay plans) to disk
-    if not is_testing:
-        _wait_for_profile_plans(repo_root, today)
-
+    tz_name = getattr(fallback_config, "timezone_name")
     profiles = discover_profile_configs(repo_root)
-    tz_name = (
-        getattr(fallback_config, "timezone_name", "")
-        or (profiles[0].timezone_name if profiles else "America/New_York")
-    )
-    start_hour = (
-        getattr(fallback_config, "schedule_start_hour", 8)
-        if fallback_config is not None
-        else (profiles[0].schedule_start_hour if profiles else 8)
-    )
-    end_hour = (
-        getattr(fallback_config, "schedule_end_hour", 23)
-        if fallback_config is not None
-        else (profiles[0].schedule_end_hour if profiles else 23)
-    )
+    accounts = {profile.queue_dir.resolve(): profile.account_name for profile in profiles}
+    queue_dir = getattr(fallback_config, "queue_dir")
+    accounts.setdefault(queue_dir.resolve(), os.getenv("ACCOUNT_NAME", "").strip() or "Clipper")
+    slots, _, _ = collect_schedule_slots(repo_root, today, now)
+    lines = [
+        f"Clipper Daily report for {today.strftime('%Y%m%d')} ({tz_name}).",
+        f"Status as of: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        "",
+        "Post Status:",
+    ]
+    total_requests = total_unknown = 0
+    costs = []
+    for queue, account in accounts.items():
+        records = {(row["scheduled_for"], row["platform"]): row for row in posts_for_day(queue, today, tz_name)}
+        # Plans from before tracking was installed must not be inferred successful from next_index.
+        for slot in slots:
+            if slot.account == account:
+                for label in slot.platforms.split(", "):
+                    platform = next((key for key, value in PLATFORM_LABELS.items() if value == label), label.lower())
+                    records.setdefault((slot.time.isoformat(), platform), {
+                        "scheduled_for": slot.time.isoformat(), "platform": platform,
+                        "status": "unknown", "detail": "No recorded outcome",
+                    })
+        youtube_file = queue / "youtube_plan.json"
+        if youtube_file.exists():
+            try:
+                plan = json.loads(youtube_file.read_text(encoding="utf-8"))
+                if plan.get("date") == today.isoformat():
+                    for entry in plan.get("entries", []):
+                        when = entry.get("scheduled_for") or entry["slot"]
+                        records[(when, YOUTUBE)] = {
+                            "scheduled_for": when, "platform": YOUTUBE,
+                            "status": entry.get("status", "unknown"),
+                            "detail": entry.get("error") or entry.get("clip_id", ""),
+                            "creator": entry.get("creator_name", ""),
+                        }
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                logger.exception("Could not read YouTube post status for %s.", account)
+                lines.append(f"  {account} | YouTube status unavailable (plan could not be read)")
+        for row in sorted(records.values(), key=lambda row: (datetime.fromisoformat(row["scheduled_for"]), row["platform"])):
+            when = datetime.fromisoformat(row["scheduled_for"]).astimezone(ZoneInfo(tz_name))
+            status = row["status"]
+            if status in {"planned", "pending"}:
+                status = "overdue / no recorded publish" if when <= now else "pending"
+            detail = f" - {row['detail']}" if row["detail"] else ""
+            creator = row.get("creator") or next(
+                (slot.creator for slot in slots if slot.account == account and slot.time == when
+                 and PLATFORM_LABELS.get(row["platform"], row["platform"]) in slot.platforms.split(", ")),
+                "",
+            )
+            creator_text = f"{creator} | " if creator else ""
+            lines.append(
+                f"  {when.strftime('%Y-%m-%d %H:%M:%S %Z')} | {account} | "
+                f"{creator_text}{PLATFORM_LABELS.get(row['platform'], row['platform'])} | {status}{detail}"
+            )
+        if not records:
+            lines.append(f"  {account} | No posts planned or recorded today.")
+        usage = apify_usage(queue, day=today, tz_name=tz_name)
+        total_requests += usage.requests
+        total_unknown += usage.unknown_calls
+        costs.append(f"{account}: {usage.requests:,} scraped clips, ${usage.cost_cad:.4f} CAD")
+    lines.extend(["", "Daily Apify Usage:", *costs, ApifyUsage(total_requests, total_unknown).email_text("day").rstrip()])
+    lines.append("Usage tracking starts when this version is deployed; earlier usage is not included.")
+    return "\n".join(lines) + "\n"
 
-    all_slots, remaining_slots, immediate_slot = collect_schedule_slots(
-        repo_root, today, now, fallback_plan=fallback_plan, fallback_config=fallback_config, immediate=immediate
-    )
 
-    body = build_schedule_alert_body(
-        all_slots=all_slots,
-        today=today,
-        tz_name=tz_name,
-        start_hour=start_hour,
-        end_hour=end_hour,
-        immediate_slot=immediate_slot,
-    )
-    subject = f"Schedule - {today.strftime('%Y%m%d')}"
-
-    sender = send_alert_fn or send_email_alert
-    return sender(
-        app_name="ClipScheduler",
-        subject=subject,
-        body=body,
-        include_platform=False,
-        include_account=False,
-    )
+def send_consolidated_daily_report(
+    repo_root: Path,
+    now: datetime,
+    fallback_config: object,
+    send_alert_fn=None,
+) -> bool:
+    if is_test_mode():
+        return False
+    coordinator_file, lock_file = _coordinator_paths(repo_root)
+    today = now.date().isoformat()
+    # Keep the lock through delivery: failed sends can retry without duplicate sends from other profiles.
+    with file_lock(lock_file, timeout_seconds=60):
+        data = _read_coordinator(coordinator_file)
+        if data.get("last_daily_report_date") == today:
+            return True
+        body = build_daily_report_body(repo_root, now, fallback_config)
+        sender = send_alert_fn or send_email_alert
+        if not sender(
+            app_name="ClipScheduler",
+            subject=f"Daily report - {now.strftime('%Y%m%d')}",
+            body=body,
+            include_platform=False,
+            include_account=False,
+        ):
+            return False
+        data["last_daily_report_date"] = today
+        _write_coordinator(coordinator_file, data)
+        return True

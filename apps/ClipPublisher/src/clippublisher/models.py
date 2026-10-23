@@ -15,3 +15,4 @@ class QueueItem:
     description: str = ""
     youtube_title: str = ""
     youtube_description: str = ""
+    transcript: str = ""

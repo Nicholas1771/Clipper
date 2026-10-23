@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1920
-BAND_MARGIN = 0.025 * OUTPUT_HEIGHT
 
 
 @dataclass(frozen=True)
@@ -45,79 +45,75 @@ def default_fraction(top_y: float, bottom_y: float, caption_position: str) -> fl
     return top_y if caption_position == "BOTTOM" else bottom_y
 
 
-def blocked_spans(layout: Layout, bands: list[dict[str, float]]) -> list[tuple[float, float]]:
-    spans = []
-    for band in bands:
-        top = layout.offset_y + float(band["top"]) * layout.source_height * layout.scale
-        bottom = layout.offset_y + float(band["bottom"]) * layout.source_height * layout.scale
-        spans.append((top - BAND_MARGIN, bottom + BAND_MARGIN))
-    return spans
-
-
-def watermark_span(
-    layout: Layout, *, box: dict | None, watermark_y: float, size: float, opacity: float
-) -> tuple[float, float] | None:
-    """Rows used by our account watermark: on the blurred source watermark when there is one, else its configured spot."""
-    font_size = round(size * OUTPUT_HEIGHT)
-    has_text = opacity > 0 and font_size >= 1
-    margin = 0.01 * OUTPUT_HEIGHT
-    if isinstance(box, dict):
-        try:
-            top = layout.offset_y + float(box["y"]) * layout.source_height * layout.scale
-            bottom = layout.offset_y + (float(box["y"]) + float(box["h"])) * layout.source_height * layout.scale
-        except (KeyError, TypeError, ValueError):
-            top = bottom = None
-        if top is not None:
-            center = (top + bottom) / 2
-            if has_text:
-                top, bottom = min(top, center - font_size / 2), max(bottom, center + font_size / 2)
-            return top - margin, bottom + margin
-    if not has_text:
-        return None
-    y = (OUTPUT_HEIGHT - font_size) * watermark_y
-    return y - margin, y + font_size + margin
-
-
-def is_clear(layout: Layout, fraction: float, spans: list[tuple[float, float]]) -> bool:
-    y = fraction * layout.max_y
-    return all(y + layout.strip_height <= top or y >= bottom for top, bottom in spans)
+def placement_grids(layout: Layout, top_y: float, bottom_y: float) -> tuple[list[float], list[float]]:
+    low, high = config_range(top_y, bottom_y)
+    if layout.max_y <= 0:
+        return [], []
+    step = layout.strip_height * 1.075
+    count = max(1, int(((high - low) * layout.max_y) // step) + 1)
+    primary = [low + step * index / layout.max_y for index in range(count)]
+    staggered = [(left + right) / 2 for left, right in zip(primary, primary[1:])]
+    return primary, staggered
 
 
 def candidate_fractions(
     layout: Layout,
     top_y: float,
     bottom_y: float,
-    bands: list[dict[str, float]],
-    keep_out: list[tuple[float, float]] | None = None,
 ) -> list[float]:
-    """Non-overlapping strip positions spread across the configured range.
-
-    Positions touching keep_out (our watermark) are always dropped; those hitting known caption text are dropped
-    unless that would leave nothing.
-    """
-    low, high = config_range(top_y, bottom_y)
-    if layout.max_y <= 0:
-        return []
-    span = (high - low) * layout.max_y
-    step = layout.strip_height * 1.15
-    count = max(1, int(span // step) + 1)
-    fractions = [low + (high - low) * index / (count - 1) for index in range(count)] if count > 1 else [low]
-    fractions = [fraction for fraction in fractions if is_clear(layout, fraction, keep_out or [])]
-    blocked = blocked_spans(layout, bands)
-    return [fraction for fraction in fractions if is_clear(layout, fraction, blocked)] or fractions
+    """All positions from both staggered grids, without content-based filtering."""
+    primary, staggered = placement_grids(layout, top_y, bottom_y)
+    return primary + staggered
 
 
-def draw_candidates(frame_paths: list[Path], layout: Layout, fractions: list[float], output_path: Path) -> Path:
-    """Frames side by side in output layout (half size), each candidate strip outlined and numbered (1-based)."""
+def aggregate_rankings(results: list[dict], count: int) -> list[dict]:
+    """Require agreement on safety; average confidence-weighted normalized ranks."""
+    scores: dict[int, list[float]] = {number: [] for number in range(1, count + 1)}
+    for result in results:
+        boxes = result.get("boxes")
+        ranking = result.get("ranked_clear_boxes")
+        if not isinstance(boxes, list) or not isinstance(ranking, list):
+            raise ValueError("Placement response must contain boxes and ranked_clear_boxes lists.")
+        if any(not isinstance(box, dict) or type(box.get("number")) is not int for box in boxes):
+            raise ValueError("Invalid placement assessment.")
+        by_number = {box["number"]: box for box in boxes}
+        if len(boxes) != count or set(by_number) != set(scores):
+            raise ValueError("Placement response must assess every position exactly once.")
+        for box in boxes:
+            confidence = box.get("confidence")
+            if type(box.get("clear")) is not bool or type(confidence) not in (float, int) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("Each position requires a boolean clear and confidence in [0, 1].")
+        clear = {number for number, box in by_number.items() if box["clear"]}
+        if any(type(number) is not int for number in ranking) or len(set(ranking)) != len(ranking) or set(ranking) != clear:
+            raise ValueError("Ranking must contain each clear position exactly once.")
+        for rank, number in enumerate(ranking):
+            confidence = by_number[number]["confidence"]
+            if confidence >= 0.7:
+                scores[number].append(confidence * (count - rank) / count)
+    return sorted(
+        [{"number": number, "score": sum(values) / len(results)}
+         for number, values in scores.items() if results and len(values) == len(results)],
+        key=lambda row: (-row["score"], row["number"]),
+    )
+
+
+def draw_candidates(
+    frame_paths: list[Path], layout: Layout, fractions: list[float], output_path: Path,
+    *, staggered: list[float] | None = None,
+) -> Path:
+    """Sampled frames in columns, with each staggered grid on its own row."""
     from PIL import Image, ImageDraw, ImageFont
 
     half_w, half_h = OUTPUT_WIDTH // 2, OUTPUT_HEIGHT // 2
-    sheet = Image.new("RGB", (half_w * len(frame_paths) + 12 * (len(frame_paths) - 1), half_h), (255, 255, 255))
+    rows = 2 if staggered is not None else 1
+    sheet = Image.new("RGB", (half_w * len(frame_paths) + 12 * (len(frame_paths) - 1), half_h * rows + 12 * (rows - 1)), (255, 255, 255))
     try:
-        font = ImageFont.load_default(size=30)
+        font = ImageFont.load_default(size=20)
     except TypeError:
         font = ImageFont.load_default()
-    for column, frame_path in enumerate(frame_paths):
+    for panel in range(len(frame_paths) * rows):
+        row, column = divmod(panel, len(frame_paths))
+        frame_path = frame_paths[column]
         canvas = Image.new("RGB", (half_w, half_h), (0, 0, 0))
         with Image.open(frame_path) as source:
             frame = source.convert("RGB")
@@ -126,16 +122,19 @@ def draw_candidates(frame_paths: list[Path], layout: Layout, fractions: list[flo
         canvas.paste(frame.resize((fitted_w, fitted_h)), ((half_w - fitted_w) // 2, (half_h - fitted_h) // 2))
         draw = ImageDraw.Draw(canvas)
         for number, fraction in enumerate(fractions, start=1):
-            top = fraction * layout.max_y / 2
+            if staggered is not None and (fraction in staggered) != (row == 1):
+                continue
+            top = round(fraction * layout.max_y) / 2
             bottom = top + layout.strip_height / 2
-            draw.rectangle((1, top, half_w - 2, bottom), outline=(255, 0, 255), width=3)
+            draw.rectangle((0, round(top), half_w - 1, round(bottom) - 1), outline=(255, 0, 255), width=2)
             label = str(number)
             box = draw.textbbox((0, 0), label, font=font)
             label_w, label_h = box[2] - box[0] + 10, box[3] - box[1] + 10
-            label_top = top + (bottom - top - label_h) / 2
-            draw.rectangle((4, label_top, 4 + label_w, label_top + label_h), fill=(255, 0, 255))
-            draw.text((9 - box[0], label_top + 5 - box[1]), label, fill=(255, 255, 255), font=font)
-        sheet.paste(canvas, (column * (half_w + 12), 0))
+            label_top = top + 2
+            left = 4
+            draw.rectangle((left, label_top, left + label_w, label_top + label_h), fill=(255, 0, 255))
+            draw.text((left + 5 - box[0], label_top + 5 - box[1]), label, fill=(255, 255, 255), font=font)
+        sheet.paste(canvas, (column * (half_w + 12), row * (half_h + 12)))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output_path, quality=90)
     return output_path

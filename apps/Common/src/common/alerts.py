@@ -84,6 +84,7 @@ def send_email_alert(
     app_name: str,
     subject: str,
     body: str,
+    html_body: str | None = None,
     platform: str = "",
     include_platform: bool | None = None,
     include_account: bool | None = None,
@@ -121,6 +122,8 @@ def send_email_alert(
     message["From"] = from_address
     message["To"] = to_address
     message.set_content(body)
+    if html_body is not None:
+        message.add_alternative(html_body, subtype="html")
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_seconds) as smtp:
@@ -148,9 +151,14 @@ def send_failure_alert(
     subject: str | None = None,
     platform: str = "",
 ) -> None:
+    from common.creators import active_creator_name
+
+    creator = active_creator_name.get()
+    creator_text = f"Creator: {creator}\n" if creator else ""
     subject = subject or (f"Fail - {clip_id}" if clip_id else f"Fail - {app_name}")
     body = (
         f"App: {app_name}\n"
+        f"{creator_text}"
         f"Context: {context}\n"
         f"Error type: {type(error).__name__}\n"
         f"Error: {error}\n"

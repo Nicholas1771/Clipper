@@ -78,6 +78,7 @@ def build_queue_item(run_dir: Path, *, use_ai_summary: bool = False) -> QueueIte
         description = _read_text(run_dir / "ai" / "summary.txt")
     youtube_title = _read_text(run_dir / "editor" / "youtube_title.txt")
     youtube_description = _read_text(run_dir / "editor" / "youtube_description.txt")
+    transcript = _read_text(run_dir / "ai" / "transcript.txt")
     return QueueItem(
         run_dir=run_dir,
         manifest_path=manifest_path,
@@ -88,6 +89,7 @@ def build_queue_item(run_dir: Path, *, use_ai_summary: bool = False) -> QueueIte
         description=description,
         youtube_title=youtube_title,
         youtube_description=youtube_description,
+        transcript=transcript,
     )
 
 
@@ -171,6 +173,22 @@ def claim_item(config: AppConfig, item: QueueItem) -> QueueItem:
         encoding="utf-8",
     )
 
+    update_scheduler_publish_state(config, "publishing")
+    return QueueItem(
+        run_dir=updated_run_dir,
+        manifest_path=new_manifest,
+        video_path=new_video,
+        clip_id=item.clip_id,
+        caption=item.caption,
+        author_handle=item.author_handle,
+        description=item.description,
+        youtube_title=item.youtube_title,
+        youtube_description=item.youtube_description,
+        transcript=item.transcript,
+    )
+
+
+def update_scheduler_publish_state(config: AppConfig, phase: str) -> None:
     scheduler_state_path = config.queue_dir / "scheduler_state.json"
     now = datetime.now(ZoneInfo(config.timezone_name))
     current_scheduler_state = {}
@@ -184,26 +202,15 @@ def claim_item(config: AppConfig, item: QueueItem) -> QueueItem:
     merged = dict(current_scheduler_state)
     slot_index = merged.get("slot_index")
     completed_slots = int(merged.get("completed_slots") or 0)
-    if isinstance(slot_index, int):
+    if phase != "publishing" and isinstance(slot_index, int):
         completed_slots = max(completed_slots, slot_index + 1)
     merged.update(
         {
             "date": now.date().isoformat(),
-            "phase": "published",
-            "next_stage": "schedule_next",
+            "phase": phase,
+            "next_stage": "publish" if phase == "publishing" else "schedule_next",
             "completed_slots": completed_slots,
             "updated_at": now.isoformat(),
         }
     )
     scheduler_state_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-    return QueueItem(
-        run_dir=updated_run_dir,
-        manifest_path=new_manifest,
-        video_path=new_video,
-        clip_id=item.clip_id,
-        caption=item.caption,
-        author_handle=item.author_handle,
-        description=item.description,
-        youtube_title=item.youtube_title,
-        youtube_description=item.youtube_description,
-    )

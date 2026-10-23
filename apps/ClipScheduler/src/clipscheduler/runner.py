@@ -11,22 +11,25 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from clipscheduler.config import AppConfig
 from common.alerts import send_email_alert
-from common.env import _find_repo_root, looks_like_windows_path
-from common.platforms import INSTAGRAM, PLATFORM_LABELS, PLATFORMS, YOUTUBE, normalize_platforms, publish_only
-from common.schedule_alerts import send_consolidated_schedule_alert, send_consolidated_started_alert
+from common.env import _find_repo_root, is_test_mode, looks_like_windows_path
+from common.platforms import INSTAGRAM, PLATFORM_LABELS, PLATFORMS, YOUTUBE, normalize_platforms
+from common.schedule_alerts import send_consolidated_daily_report, send_consolidated_schedule_alert, send_consolidated_started_alert
+from common.reporting import record_post
+from common.creators import Creator
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_PHASES = {"scheduled", "source_consumed", "ai_processed", "edited"}
-FINISHED_PHASES = {"published", "source_failed"}
+ACTIVE_PHASES = {"scheduled", "source_consumed", "ai_processed", "edited", "publishing"}
+FINISHED_PHASES = {"published", "source_failed", "publish_failed"}
 STALE_CYCLE_HOURS = 3
 MIN_GAP_FLOOR_SECONDS = 60
 STAGES = ("scheduler", "sourcer", "ai", "editor", "publisher")
-STAGE_PHASE_RANK = {"scheduled": 0, "source_consumed": 1, "ai_processed": 2, "edited": 3, "published": 4}
+STAGE_PHASE_RANK = {"scheduled": 0, "source_consumed": 1, "ai_processed": 2, "edited": 3, "publishing": 3, "published": 4}
 YOUTUBE_STATE_FILES = {"youtube_plan.json", "youtube_history.json"}
 
 
@@ -51,6 +54,8 @@ class DayPlan:
     next_index: int = 0
     platforms: list[list[str]] = field(default_factory=list)
     youtube_slots: list[datetime] = field(default_factory=list)
+    creators: list[str] = field(default_factory=list)
+    creator_names: list[str] = field(default_factory=list)
 
     def platforms_for(self, index: int) -> list[str]:
         return list(self.platforms[index]) if 0 <= index < len(self.platforms) else [INSTAGRAM]
@@ -65,6 +70,9 @@ class ClipSchedulerRunner:
         self._startup_alert_sent = False
         self._resume_index: int | None = None
         self._youtube_retry_at: datetime | None = None
+        self._report_retry_at: datetime | None = None
+        self._report_sent_day: date | None = None
+        self._immediate_creator: tuple[str, str, list[str]] | None = None
 
     def _local_now(self) -> datetime:
         return datetime.now(self._tz)
@@ -88,8 +96,37 @@ class ClipSchedulerRunner:
 
     def _target_slot_count(self, *, remaining_fraction: float) -> int:
         """Exactly posts-per-day for a full window, scaled down proportionally when starting mid-window."""
-        posts_per_day = max(self._platform_quotas().values())
+        posts_per_day = (
+            sum(max(self._creator_quotas(creator)) for creator in self.config.creators)
+            if self.config.creators else max(self._platform_quotas().values())
+        )
         return max(0, round(posts_per_day * max(0.0, min(1.0, remaining_fraction))))
+
+    def _creator_quotas(self, creator: Creator) -> tuple[int, int]:
+        ig, yt = creator.instagram_posts_per_day, creator.youtube_posts_per_day
+        if self.config.youtube_selection_mode == "instagram_top":
+            return ig, 0
+        return ig, yt
+
+    def _creator_tickets(self) -> list[tuple[str, str, list[str]]]:
+        tickets: list[tuple[str, str, list[str]]] = []
+        for creator in self.config.creators:
+            ig, yt = self._creator_quotas(creator)
+            count = max(ig, yt)
+            ig_indices = set(self._rng.sample(range(count), ig))
+            yt_indices = set(self._rng.sample(range(count), yt))
+            for index in range(count):
+                platforms = ([INSTAGRAM] if index in ig_indices else []) + ([YOUTUBE] if index in yt_indices else [])
+                tickets.append((creator.name, creator.display_name, platforms))
+        return tickets
+
+    def _assign_creators(self, plan: DayPlan) -> None:
+        if not self.config.creators:
+            return
+        tickets = self._rng.sample(self._creator_tickets(), len(plan.slots))
+        plan.creators = [ticket[0] for ticket in tickets]
+        plan.creator_names = [ticket[1] for ticket in tickets]
+        plan.platforms = [ticket[2] for ticket in tickets]
 
     def _generate_daily_slots(
         self, now: datetime, rng: random.Random | None = None, *, exact_count: int | None = None
@@ -117,6 +154,11 @@ class ClipSchedulerRunner:
         gap = max(MIN_GAP_FLOOR_SECONDS, self.config.min_gap_minutes * 60)
         max_count = (span - 1) // gap + 1
         target_count = exact_count if exact_count is not None else self._target_slot_count(remaining_fraction=remaining_fraction)
+        if self.config.creators and remaining_fraction >= 1 and target_count > max_count:
+            raise ValueError(
+                f"{target_count} daily creator slots do not fit the account window with MIN_GAP_MINUTES="
+                f"{self.config.min_gap_minutes}; widen the window or reduce the minimum gap."
+            )
         count = min(target_count, max_count)
         if count <= 0:
             return []
@@ -133,12 +175,8 @@ class ClipSchedulerRunner:
             INSTAGRAM: max(0, self.config.instagram_posts_per_day),
             YOUTUBE: max(0, self.config.youtube_posts_per_day),
         }
-        only = publish_only()
         if self.config.youtube_selection_mode == "instagram_top":
-            return {INSTAGRAM: quotas[INSTAGRAM] if only != YOUTUBE else 0, YOUTUBE: 0}
-        if only:
-            # --publish: only that platform, at its own rate (or the busier rate if it has none configured).
-            quotas = {name: (max(quotas[name], max(quotas.values())) if name == only else 0) for name in quotas}
+            return {INSTAGRAM: quotas[INSTAGRAM], YOUTUBE: 0}
         return quotas
 
     def _assign_platforms(self, count: int, rng: random.Random | None = None) -> list[list[str]]:
@@ -185,6 +223,7 @@ class ClipSchedulerRunner:
         else:
             slots = self._generate_daily_slots(now)
             self._plan = DayPlan(day=today, slots=slots, platforms=self._assign_platforms(len(slots)))
+            self._assign_creators(self._plan)
             self._plan.youtube_slots = self._generate_youtube_slots(now)
             self._save_plan(now)
             logger.info(
@@ -193,6 +232,7 @@ class ClipSchedulerRunner:
                 today.isoformat(),
                 [
                     f"{slot.strftime('%Y-%m-%d %H:%M:%S %Z')} [{'+'.join(self._plan.platforms_for(index))}]"
+                    f" {self._plan.creator_names[index] if self._plan.creator_names else ''}"
                     for index, slot in enumerate(slots)
                 ],
             )
@@ -203,7 +243,7 @@ class ClipSchedulerRunner:
         return self._plan
 
     def _generate_youtube_slots(self, now: datetime) -> list[datetime]:
-        if self.config.youtube_selection_mode != "instagram_top" or publish_only() == INSTAGRAM:
+        if self.config.youtube_selection_mode != "instagram_top":
             return []
         quota = max(0, self.config.youtube_posts_per_day)
         if not quota:
@@ -212,13 +252,20 @@ class ClipSchedulerRunner:
             self.config,
             schedule_start_hour=self.config.youtube_start_hour,
             schedule_end_hour=self.config.youtube_end_hour,
-            schedule_peak_hour=self.config.youtube_peak_hour,
             instagram_posts_per_day=quota,
             youtube_posts_per_day=0,
             youtube_selection_mode="shared",
+            creators=(),
         )
         window_runner = ClipSchedulerRunner(window_config, rng=self._rng)
-        return window_runner._generate_daily_slots(now, exact_count=quota)
+        slots = window_runner._generate_daily_slots(now, exact_count=quota)
+        start, _ = window_runner._schedule_window(now.date())
+        if self.config.creators and now <= start and len(slots) < quota:
+            raise ValueError(
+                f"{quota} daily YouTube creator slots do not fit the YouTube window with "
+                f"MIN_GAP_MINUTES={self.config.min_gap_minutes}; widen the window or reduce the minimum gap."
+            )
+        return slots
 
     def _prepare_youtube_selection(self, now: datetime, slots: list[datetime]) -> bool:
         publisher_root = Path(__file__).resolve().parents[3] / "ClipPublisher"
@@ -238,6 +285,7 @@ class ClipSchedulerRunner:
         slots = self._generate_daily_slots(now)
         plan = DayPlan(day=now.date(), slots=slots, platforms=self._assign_platforms(len(slots)),
                        youtube_slots=self._generate_youtube_slots(now))
+        self._assign_creators(plan)
         if self.config.youtube_selection_mode != "instagram_top" or not plan.youtube_slots or now.hour >= self.config.youtube_end_hour:
             return plan, None
         publisher_root = Path(__file__).resolve().parents[3] / "ClipPublisher"
@@ -255,7 +303,6 @@ class ClipSchedulerRunner:
     def _ensure_youtube_selection(self, now: datetime) -> None:
         if (
             self.config.youtube_selection_mode != "instagram_top"
-            or publish_only() == INSTAGRAM
             or os.getenv("CLIPPER_TEST_MODE")
             or self._plan is None
             or not self._plan.youtube_slots
@@ -280,15 +327,12 @@ class ClipSchedulerRunner:
         next_index = saved.get("next_index")
         next_index = next_index if isinstance(next_index, int) else 0
         saved_platforms = saved.get("platforms")
-        if not publish_only() and isinstance(saved_platforms, list) and len(saved_platforms) == len(slots) and all(isinstance(item, list) for item in saved_platforms):
+        if isinstance(saved_platforms, list) and len(saved_platforms) == len(slots) and all(isinstance(item, list) for item in saved_platforms):
             platforms = [normalize_platforms(item) for item in saved_platforms]
         else:
             platforms = self._assign_platforms(len(slots))
         if self.config.youtube_selection_mode == "instagram_top":
             platforms = [[platform for platform in assignment if platform != YOUTUBE] for assignment in platforms]
-            if publish_only() == YOUTUBE:
-                slots = []
-                platforms = []
         raw_youtube_slots = saved.get("youtube_slots", [])
         youtube_slots: list[datetime] = []
         if not isinstance(raw_youtube_slots, list):
@@ -301,8 +345,19 @@ class ClipSchedulerRunner:
                     youtube_slots = []
                     break
                 youtube_slots.append(parsed)
+        creators = saved.get("creators", [])
+        creator_names = saved.get("creator_names", [])
+        if self.config.creators and not creators:
+            if len(self.config.creators) != 1:
+                raise ValueError("Saved account plan has no creator assignments; finish the existing plan before adding creators.")
+            creators = [self.config.creators[0].name] * len(slots)
+            creator_names = [self.config.creators[0].display_name] * len(slots)
+        if creators and (len(creators) != len(slots) or len(creator_names) != len(slots)):
+            raise ValueError("Saved schedule has invalid creator assignments.")
+        if self.config.creators and any(name not in {c.name for c in self.config.creators} for name in creators):
+            raise ValueError("Saved schedule references a creator no longer configured on this account.")
         return DayPlan(day=today, slots=slots, next_index=max(0, min(next_index, len(slots))), platforms=platforms,
-                       youtube_slots=youtube_slots)
+                       youtube_slots=youtube_slots, creators=creators, creator_names=creator_names)
 
     def prepare_startup(self) -> None:
         """Keep today's saved plan across restarts; drop only the interrupted cycle so its slot runs again."""
@@ -324,13 +379,20 @@ class ClipSchedulerRunner:
         if os.getenv("CLIPPER_TEST_MODE"):
             return
         repo_root = _find_repo_root(Path(__file__).resolve())
+        alert_config: AppConfig | SimpleNamespace = self.config
+        if immediate is not None and self._immediate_creator is not None:
+            alert_config = SimpleNamespace(
+                **vars(self.config),
+                immediate_creator_name=self._immediate_creator[1],
+                immediate_platforms=self._immediate_creator[2],
+            )
         try:
             if started:
                 send_consolidated_started_alert(
                     repo_root=repo_root,
                     now=now,
                     fallback_plan=plan,
-                    fallback_config=self.config,
+                    fallback_config=alert_config,
                     immediate=immediate,
                     send_alert_fn=send_email_alert,
                 )
@@ -339,7 +401,7 @@ class ClipSchedulerRunner:
                     repo_root=repo_root,
                     now=now,
                     fallback_plan=plan,
-                    fallback_config=self.config,
+                    fallback_config=alert_config,
                     immediate=immediate,
                     send_alert_fn=send_email_alert,
                 )
@@ -350,16 +412,23 @@ class ClipSchedulerRunner:
         plan = self._plan
         if plan is None:
             return
+        for index, slot in enumerate(plan.slots):
+            record_post(
+                self.config.queue_dir, slot.isoformat(), plan.platforms_for(index), "planned",
+                creator=plan.creator_names[index] if plan.creator_names else "",
+            )
         save_json(
             self._plan_path(),
             {
                 "date": plan.day.isoformat(),
-                "posts_per_day": max(self._platform_quotas().values()),
+                "posts_per_day": self._target_slot_count(remaining_fraction=1.0),
                 "instagram_posts_per_day": max(0, self.config.instagram_posts_per_day),
                 "youtube_posts_per_day": max(0, self.config.youtube_posts_per_day),
                 "planned_slots": len(plan.slots),
                 "slots": [slot.isoformat() for slot in plan.slots],
                 "platforms": plan.platforms,
+                "creators": plan.creators,
+                "creator_names": plan.creator_names,
                 "future_slots": [slot.isoformat() for slot in plan.slots[plan.next_index :]],
                 "next_index": plan.next_index,
                 "updated_at": now.isoformat(),
@@ -396,13 +465,26 @@ class ClipSchedulerRunner:
             "platforms": normalize_platforms(resolved_platforms),
             "updated_at": (now or datetime.now(self._tz)).isoformat(),
         }
+        if self.config.creators:
+            if slot_index >= 0 and self._plan is not None and self._plan.creators:
+                payload["creator"] = self._plan.creators[slot_index]
+                payload["creator_name"] = self._plan.creator_names[slot_index]
+            else:
+                creator = self._immediate_creator or self._rng.choice(self._creator_tickets())
+                payload["creator"], payload["creator_name"] = creator[0], creator[1]
+                payload["platforms"] = creator[2]
         state_path = self._ready_marker_path()
+        record_post(
+            self.config.queue_dir, when.isoformat(), payload["platforms"], "in progress",
+            creator=payload.get("creator_name", ""),
+        )
         save_json(state_path, payload)
         logger.info(
-            "ClipScheduler marked queue ready at %s for %s (platforms: %s).",
+            "ClipScheduler marked queue ready at %s for %s (platforms: %s; creator: %s).",
             when.isoformat(),
             f"slot {slot_index + 1}/{len(resolved_slots)}" if slot_index >= 0 else "an immediate (--now) run",
             ", ".join(payload["platforms"]) or "none",
+            payload.get("creator_name") or "legacy",
         )
         return state_path
     def clear_schedule_artifacts(self) -> None:
@@ -465,7 +547,7 @@ class ClipSchedulerRunner:
         """Return 'reached', 'failed' or 'pending' based on the shared scheduler state."""
         state = load_json(self._ready_marker_path())
         phase = state.get("phase") if isinstance(state, dict) else None
-        if phase == "source_failed":
+        if phase in {"source_failed", "publish_failed"}:
             return "failed"
         return "reached" if STAGE_PHASE_RANK.get(phase, -1) >= STAGES.index(stage) else "pending"
 
@@ -503,10 +585,14 @@ class ClipSchedulerRunner:
     def fire_now(self) -> str:
         """Start one cycle immediately for every enabled platform, outside the planned slots (works after the window closed)."""
         now = self._local_now()
+        if self.config.creators:
+            tickets = self._creator_tickets()
+            if not tickets:
+                self.ensure_plan(now)
+                logger.info("No fresh-source creator slots are enabled; only the YouTube replay plan will run.")
+                return "waiting"
+            self._immediate_creator = self._rng.choice(tickets)
         plan = self.ensure_plan(now, immediate=now)
-        if self.config.youtube_selection_mode == "instagram_top" and publish_only() == YOUTUBE:
-            logger.info("YouTube-only mode uses the morning replay plan; no fresh sourcing cycle will be fired.")
-            return "waiting"
         marker = self._mark_ready(
             when=now,
             slot_index=-1,
@@ -518,6 +604,11 @@ class ClipSchedulerRunner:
 
     def run_once(self, now: datetime | None = None) -> str:
         now = now.astimezone(self._tz) if now is not None else self._local_now()
+        result = self._run_once(now)
+        self._send_daily_report_if_due(now)
+        return result
+
+    def _run_once(self, now: datetime) -> str:
         plan = self.ensure_plan(now)
         state_path = self._ready_marker_path()
         state = self._read_today_state(now.date())
@@ -539,6 +630,10 @@ class ClipSchedulerRunner:
             last_update = self._parse_time(state.get("updated_at")) or self._parse_time(state.get("scheduled_for"))
             if last_update is not None and now - last_update > timedelta(hours=STALE_CYCLE_HOURS):
                 logger.warning("Abandoning stale scheduler cycle (phase=%s, last update %s).", phase, last_update.isoformat())
+                record_post(
+                    self.config.queue_dir, str(state.get("scheduled_for") or ""),
+                    state.get("platforms") or [INSTAGRAM], "abandoned", f"No progress for {STALE_CYCLE_HOURS} hours",
+                )
                 if isinstance(slot_index, int):
                     completed = max(completed, slot_index + 1)
                 phase = "waiting_next_slot"
@@ -568,6 +663,8 @@ class ClipSchedulerRunner:
         skipped = fire_index - plan.next_index
         if skipped:
             logger.warning("Skipping %s overdue slot(s) before slot %s.", skipped, fire_index + 1)
+            for index in range(plan.next_index, fire_index):
+                record_post(self.config.queue_dir, plan.slots[index].isoformat(), plan.platforms_for(index), "skipped", "Overdue slot coalesced")
         marker = self._mark_ready(
             when=plan.slots[fire_index],
             slot_index=fire_index,
@@ -579,6 +676,23 @@ class ClipSchedulerRunner:
         plan.next_index = fire_index + 1
         self._save_plan(now)
         return str(marker)
+
+    def _send_daily_report_if_due(self, now: datetime) -> None:
+        if (
+            now.strftime("%H:%M") < self.config.daily_report_time
+            or self._report_sent_day == now.date()
+            or (self._report_retry_at is not None and now < self._report_retry_at)
+            or is_test_mode()
+        ):
+            return
+        self._report_retry_at = now + timedelta(minutes=1)
+        try:
+            if send_consolidated_daily_report(
+                _find_repo_root(Path(__file__).resolve()), now, self.config, send_alert_fn=send_email_alert,
+            ):
+                self._report_sent_day = now.date()
+        except Exception:
+            logger.exception("Failed to send consolidated daily report email; will retry.")
 
     def run_forever(self) -> None:
         logger.info("Watching queue %s for the scheduled source window.", self.config.queue_dir)

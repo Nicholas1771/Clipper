@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ import requests
 from clippublisher.config import AppConfig
 from clippublisher.instagram_client import _split_trailing_hashtags
 from clippublisher.models import QueueItem
+from common.creators import read_creator
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,19 @@ VALID_PRIVACY = {"public", "unlisted", "private"}
 
 class YouTubeError(RuntimeError):
     pass
+
+
+class YouTubePolicyError(YouTubeError):
+    """AI identified a policy concern; another replay candidate may be selected."""
+
+
+class YouTubeScreeningError(YouTubeError):
+    """AI review could not complete; publishing must not proceed unchecked."""
+
+
+@dataclass(frozen=True)
+class YouTubeApproval:
+    fingerprint: str
 
 
 def read_refresh_token(token_file: Path) -> str:
@@ -77,7 +93,8 @@ def build_title(config: AppConfig, item: QueueItem) -> str:
     text = " ".join(text.split()) or "Clip"
     if len(text) > MAX_TITLE_LENGTH:
         text = text[:MAX_TITLE_LENGTH].rsplit(" ", 1)[0].rstrip(" ,;:-") or text[:MAX_TITLE_LENGTH]
-    streamer = getattr(config, "streamer_hashtag", "") or ""
+    creator = read_creator(item.run_dir)
+    streamer = str(creator.get("settings", {}).get("STREAMER_HASHTAG") or getattr(config, "streamer_hashtag", "") or "").strip().lstrip("#")
     seen: set[str] = set()
     title = text
     for tag in ([f"#{streamer}"] if streamer else []) + others:
@@ -95,6 +112,92 @@ def build_video_metadata(config: AppConfig, item: QueueItem) -> dict[str, Any]:
         "snippet": {"title": build_title(config, item), "description": "", "categoryId": config.youtube_category_id},
         "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
+
+
+def _screening_content(config: AppConfig, item: QueueItem) -> dict[str, str]:
+    return {
+        "title": build_title(config, item),
+        "caption": item.caption,
+        "summary": item.description,
+        "youtube_title": item.youtube_title,
+        "youtube_description": item.youtube_description,
+        "transcript": item.transcript,
+    }
+
+
+def _read_screening_prompt(config: AppConfig) -> str:
+    if config.prompts_dir is None:
+        raise YouTubeScreeningError("AI_PROMPTS_DIR is required for YouTube AI policy screening.")
+    path = config.prompts_dir / "youtube_policy_screening.txt"
+    try:
+        prompt = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise YouTubeScreeningError(f"Cannot read YouTube AI policy prompt {path}: {error}") from error
+    if not prompt:
+        raise YouTubeScreeningError(f"YouTube AI policy prompt is empty: {path}")
+    return prompt
+
+
+def _screening_fingerprint(config: AppConfig, item: QueueItem, prompt: str) -> str:
+    return hashlib.sha256(json.dumps(
+        [config.gemini_model, prompt, _screening_content(config, item)],
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+
+
+def screen_youtube_content(config: AppConfig, item: QueueItem) -> YouTubeApproval:
+    """Require an explicit contextual AI approval before uploading to YouTube."""
+    if not config.google_api_key:
+        raise YouTubeScreeningError("GOOGLE_API_KEY is required for YouTube AI policy screening.")
+    prompt = _read_screening_prompt(config)
+    content = _screening_content(config, item)
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent",
+            headers={"x-goog-api-key": config.google_api_key},
+            json={
+                "systemInstruction": {"parts": [{"text": prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": json.dumps(content)}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                    "responseSchema": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "decision": {"type": "STRING", "enum": ["allow", "block", "review"]},
+                            "reason": {"type": "STRING"},
+                        },
+                        "required": ["decision", "reason"],
+                    },
+                },
+            },
+            timeout=(10, config.timeout_seconds),
+        )
+    except requests.RequestException:
+        raise YouTubeScreeningError("YouTube AI policy screening request failed; upload blocked.") from None
+    if response.status_code != 200:
+        raise YouTubeScreeningError(
+            f"YouTube AI policy screening failed (HTTP {response.status_code}); upload blocked."
+        )
+    try:
+        payload = response.json()
+        candidate = payload["candidates"][0]
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("AI review did not finish normally")
+        result = json.loads("".join(part.get("text", "") for part in candidate["content"]["parts"]))
+        if (
+            not isinstance(result, dict)
+            or result.get("decision") not in ("allow", "block", "review")
+            or not isinstance(result.get("reason"), str)
+            or not result["reason"].strip()
+        ):
+            raise ValueError("Invalid AI review decision")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        raise YouTubeScreeningError("YouTube AI policy screening returned no valid decision; upload blocked.") from None
+    if result["decision"] != "allow":
+        raise YouTubePolicyError(f"YouTube AI policy screening ({result['decision']}): {result['reason']}")
+    logger.info("YouTube AI policy screening approved clip %s: %s", item.clip_id, result["reason"])
+    return YouTubeApproval(_screening_fingerprint(config, item, prompt))
 
 
 def _start_session(access_token: str, metadata: dict[str, Any], size: int) -> str:
@@ -167,7 +270,11 @@ def upload_video(access_token: str, video_path: Path, metadata: dict[str, Any]) 
     raise YouTubeError(f"YouTube upload failed after {MAX_UPLOAD_ATTEMPTS} attempts: {last_error}")
 
 
-def publish_to_youtube(config: AppConfig, item: QueueItem) -> dict[str, Any]:
+def publish_to_youtube(
+    config: AppConfig, item: QueueItem, *, approval: YouTubeApproval | None = None,
+) -> dict[str, Any]:
+    if approval is None or approval.fingerprint != _screening_fingerprint(config, item, _read_screening_prompt(config)):
+        screen_youtube_content(config, item)
     access_token = fetch_access_token(config)
     video = upload_video(access_token, item.video_path, build_video_metadata(config, item))
     video_id = str(video.get("id") or "")

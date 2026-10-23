@@ -21,21 +21,21 @@ class SeenSyncHookTests(unittest.TestCase):
 
     def test_disabled_by_default(self):
         run = mock.Mock()
-        self.record({"SYNC_SEEN_TO_PRODUCTION": "", "CLIPPER_PROFILE": "n3on"}, run)
+        self.record({"SYNC_SEEN_TO_PRODUCTION": "", "CLIPPER_PROFILE": "carootclips"}, run)
         run.assert_not_called()
 
     def test_enabled_runs_sync_for_active_profile(self):
         run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="[n3on] ok", stderr=""))
-        self.record({"SYNC_SEEN_TO_PRODUCTION": "true", "CLIPPER_PROFILE": "n3on"}, run)
+        self.record({"SYNC_SEEN_TO_PRODUCTION": "true", "CLIPPER_PROFILE": "carootclips"}, run)
         command = run.call_args.args[0]
         self.assertTrue(command[1].endswith("sync_seen_ids.py"))
-        self.assertEqual("--n3on", command[2])
+        self.assertEqual("--carootclips", command[2])
 
     def test_sync_failure_never_raises(self):
         run = mock.Mock(side_effect=OSError("no ssh"))
         with self.assertLogs(runner_module.logger, "WARNING") as logs:
-            self.record({"SYNC_SEEN_TO_PRODUCTION": "true", "CLIPPER_PROFILE": "n3on"}, run)
-        self.assertIn("sync_seen_ids.py --n3on", logs.output[0])
+            self.record({"SYNC_SEEN_TO_PRODUCTION": "true", "CLIPPER_PROFILE": "carootclips"}, run)
+        self.assertIn("sync_seen_ids.py --carootclips", logs.output[0])
 
 
 if __name__ == "__main__":

@@ -17,3 +17,4 @@ Rules:
 - Return only JSON with schema {"has_caption": boolean, "caption_position": "TOP|MIDDLE|BOTTOM|BOTH|NONE", "text_bands": [{"top": number, "bottom": number}], "confidence": number}.
 
 Available details: __CONTEXT__
+Also include "on_screen_caption": a string transcribing clearly readable overlaid caption/title/subtitle text from these frames, preserving names, deduplicating repeated text, ignoring watermarks/usernames/logos/branding, and returning "" if absent or unreadable; never guess missing words.

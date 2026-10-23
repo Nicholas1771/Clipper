@@ -47,6 +47,13 @@ def _find_repo_root(app_root: Path) -> Path:
 DEFAULT_PROFILE = "default"
 
 
+def available_accounts(repo_root: Path) -> list[str]:
+    return sorted(
+        path.stem for path in (repo_root / "accounts").glob("*.env")
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", path.stem)
+    )
+
+
 def active_profile() -> str:
     """Profile name chosen by the launcher (CLIPPER_PROFILE); `default` when unset."""
     return (os.getenv("CLIPPER_PROFILE") or DEFAULT_PROFILE).strip().lower()
@@ -55,20 +62,41 @@ def active_profile() -> str:
 def _load_profile_env(repo_root: Path) -> None:
     profile = active_profile()
     if not os.getenv("CLIPPER_PROFILE"):
-        available_profiles = sorted((repo_root / "profiles").glob("*.env"))
+        available_profiles = available_accounts(repo_root)
         if available_profiles:
-            profile = available_profiles[0].stem.lower()
+            profile = available_profiles[0]
     os.environ["CLIPPER_PROFILE"] = profile
-    profile_env = repo_root / "profiles" / f"{profile}.env"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", profile):
+        raise ValueError(f"Invalid account selector: {profile}")
+    profile_env = repo_root / "accounts" / f"{profile}.env"
     if not profile_env.exists():
-        raise FileNotFoundError(f"Profile '{profile}' has no config file at {profile_env}.")
+        raise FileNotFoundError(f"Account '{profile}' has no config file at {profile_env}.")
     load_dotenv(profile_env, override=False)
-    local_profile_env = repo_root / "profiles" / f"{profile}.local.env"
-    load_dotenv(local_profile_env, override=False)
-    required = ("ACCOUNT_NAME", "STREAMER_NAME", "STREAMER_HASHTAG", "QUEUE_DIR", "OVERLAY_IMAGE_PATH")
+    required = ("ACCOUNT_NAME", "CREATORS")
     missing = [key for key in required if not os.getenv(key, "").strip()]
     if missing:
-        raise ValueError(f"Profile '{profile}' ({profile_env}) is missing required settings: {', '.join(missing)}")
+        raise ValueError(f"Account '{profile}' ({profile_env}) is missing required settings: {', '.join(missing)}")
+    from common.creators import configured_creators
+
+    creators = configured_creators(repo_root)
+    if not creators or not any(c.instagram_posts_per_day or c.youtube_posts_per_day for c in creators):
+        raise ValueError(f"Account '{profile}' needs at least one creator with a positive daily quota.")
+    account = os.environ["ACCOUNT_NAME"]
+    base = f"data/state/{account}"
+    defaults = {
+        "QUEUE_DIR": f"{base}/queue",
+        "STATE_FILE": f"{base}/state.json",
+        "CANDIDATE_CACHE_FILE": f"{base}/candidate_cache_{{CREATOR_NAME}}.json",
+        "TOKEN_STATE_FILE": f"{base}/publisher_token_state.json",
+        "YOUTUBE_TOKEN_FILE": f"{base}/youtube_token.json",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+    os.environ["INSTAGRAM_POSTS_PER_DAY"] = str(sum(c.instagram_posts_per_day for c in creators))
+    os.environ["YOUTUBE_POSTS_PER_DAY"] = str(sum(c.youtube_posts_per_day for c in creators))
+    # The first creator supplies defaults for standalone tools and pre-migration queue items.
+    for key in ("STREAMER_NAME", "STREAMER_HASHTAG", "OVERLAY_IMAGE_PATH"):
+        os.environ.setdefault(key, creators[0].settings[key])
 
 
 def resolve_asset_path(raw: str, *bases: Path) -> Path:
@@ -99,7 +127,6 @@ def _apply_test_mode(repo_root: Path) -> None:
         test_dir = str(base / "Test")
         os.environ["CLIPPER_TEST_QUEUE_DIR"] = test_dir
     os.environ["QUEUE_DIR"] = test_dir
-    os.environ["OUTPUT_DIR"] = test_dir
 
 
 def load_app_env(app_root: Path) -> Path:
@@ -108,7 +135,7 @@ def load_app_env(app_root: Path) -> Path:
     shared_env = repo_root / ".env"
     app_env = app_root / ".env"
 
-    # Precedence: process env > profile-local secrets > profile config > app .env > root .env
+    # Precedence: process env > account/creator config > app .env > root .env
     _load_profile_env(repo_root)
     load_dotenv(app_env, override=False)
     if shared_env != app_env:

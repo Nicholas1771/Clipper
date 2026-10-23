@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 import time
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from imageio_ffmpeg import get_ffmpeg_exe
 
 from common.alerts import send_failure_alert
 from common.platforms import YOUTUBE, read_slot_platforms
+from common.creators import config_for_run
 from clipai.config import AppConfig
 from clipai import kick_placement
 from clipai.static_regions import StaticRegion, draw_candidates, draw_zoom_sheet, find_static_regions, union_box
@@ -42,6 +44,10 @@ class GeminiRetryableServiceError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class GeminiTruncatedResponseError(RuntimeError):
+    pass
+
+
 def _read_json(path: Path) -> Any:
     if not path.exists():
         return {}
@@ -59,6 +65,7 @@ def _write_json(path: Path, payload: dict) -> None:
 class ClipAIService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._base_config = config
         self._tz = ZoneInfo(config.timezone_name)
 
     def _queue_state_path(self, run_dir: Path) -> Path:
@@ -154,18 +161,24 @@ class ClipAIService:
         template = self._read_prompt_template("caption_detection.txt")
         return self._fill_prompt(template, {"CONTEXT": context or "No metadata provided."})
 
-    def _build_context_prompt(self, caption: str) -> str:
+    def _build_context_prompt(self, caption: str, on_screen_caption: str = "") -> str:
         template = self._read_prompt_template("context_analysis.txt")
-        return self._fill_prompt(template, {"CAPTION": caption or "No caption provided.", "STREAMER": self.config.streamer_name})
+        return self._fill_prompt(template, {
+            "CAPTION": caption or "No caption provided.", "STREAMER": self.config.streamer_name,
+            "ON_SCREEN_CAPTION": on_screen_caption or "None detected.",
+        })
 
-    def _build_summary_prompt(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+    def _build_summary_prompt(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         template = self._read_prompt_template("summary_clip.txt" if context_sufficient else "summary_streamer.txt")
         return self._fill_prompt(
             template,
-            {"CAPTION": caption, "TRANSCRIPT": transcript, "STREAMER": self.config.streamer_name},
+            {
+                "CAPTION": caption, "TRANSCRIPT": transcript, "STREAMER": self.config.streamer_name,
+                "ON_SCREEN_CAPTION": on_screen_caption or "None detected.",
+            },
         )
 
-    def _build_youtube_prompt(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+    def _build_youtube_prompt(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         template = self._read_prompt_template("youtube_description.txt")
         return self._fill_prompt(
             template,
@@ -174,6 +187,7 @@ class ClipAIService:
                 "TRANSCRIPT": transcript,
                 "STREAMER": self.config.streamer_name,
                 "CONTEXT_SUFFICIENT": "yes" if context_sufficient else "no",
+                "ON_SCREEN_CAPTION": on_screen_caption or "None detected.",
             },
         )
 
@@ -202,6 +216,8 @@ class ClipAIService:
         model: str | None = None,
         plain_text: bool = False,
         temperature: float = 0.2,
+        max_output_tokens: int | None = None,
+        thinking_budget: int | None = None,
     ) -> dict[str, Any]:
         """Returns parsed JSON, or {"text": ...} when plain_text is set (free-form output keeps length and paragraphs)."""
         if not self.config.google_api_key:
@@ -232,6 +248,10 @@ class ClipAIService:
         if response_schema is not None and not plain_text:
             payload["generationConfig"]["responseMimeType"] = "application/json"
             payload["generationConfig"]["responseSchema"] = response_schema
+        if max_output_tokens is not None:
+            payload["generationConfig"]["maxOutputTokens"] = max_output_tokens
+        if thinking_budget is not None:
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
 
         try:
             response = requests.post(url, json=payload, timeout=(10, self.config.timeout_seconds))
@@ -264,6 +284,12 @@ class ClipAIService:
         candidates = data.get("candidates") or []
         if not candidates:
             raise RuntimeError(f"Gemini API returned no candidates: {data}")
+
+        finish_reason = candidates[0].get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            raise GeminiTruncatedResponseError("Gemini response reached MAX_TOKENS; incomplete output was rejected.")
+        if finish_reason and finish_reason != "STOP":
+            raise RuntimeError(f"Gemini response did not finish successfully: {finish_reason}.")
 
         content = candidates[0].get("content") or {}
         parts = content.get("parts") or []
@@ -350,9 +376,20 @@ class ClipAIService:
             return []
         return self._extract_sample_frames(run_dir, video_path)
 
-    def _detect_overlay_visual(self, manifest: dict[str, Any], *, run_dir: Path | None = None) -> dict[str, Any]:
+    def source_has_kick_branding(self, video_path: Path, manifest: dict[str, Any]) -> bool:
+        """Use the same strict visual detector for pre-cache sourcing admission."""
+        with tempfile.TemporaryDirectory(prefix="clipper-branding-") as directory:
+            run_dir = Path(directory)
+            frames = self._extract_sample_frames(run_dir, video_path)
+            if not frames:
+                raise RuntimeError(f"No source frames could be extracted for Kick branding screening: {video_path}")
+            return bool(self._detect_overlay_visual(manifest, image_paths=frames)["has_kick_overlay"])
+
+    def _detect_overlay_visual(
+        self, manifest: dict[str, Any], *, run_dir: Path | None = None, image_paths: list[Path] | None = None
+    ) -> dict[str, Any]:
         context = self._summarize_context(manifest)
-        image_paths: list[Path] = self._collect_source_frames(run_dir)
+        image_paths = image_paths if image_paths is not None else self._collect_source_frames(run_dir)
         schema = {
             "type": "OBJECT",
             "properties": {
@@ -400,6 +437,7 @@ class ClipAIService:
             "type": "OBJECT",
             "properties": {
                 "has_caption": {"type": "BOOLEAN"},
+                "on_screen_caption": {"type": "STRING"},
                 "caption_position": {"type": "STRING"},
                 "text_bands": {
                     "type": "ARRAY",
@@ -411,7 +449,7 @@ class ClipAIService:
                 },
                 "confidence": {"type": "NUMBER"},
             },
-            "required": ["has_caption", "caption_position", "text_bands", "confidence"],
+            "required": ["has_caption", "caption_position", "text_bands", "confidence", "on_screen_caption"],
         }
         payload = self._call_gemini(self._build_caption_prompt(context), response_schema=schema, image_paths=image_paths)
         caption_position = self._normalize_caption_position(payload.get("caption_position"))
@@ -430,6 +468,11 @@ class ClipAIService:
             "caption_position": caption_position,
             "caption_confidence": confidence,
             "caption_bands": bands,
+            "on_screen_caption": (
+                payload["on_screen_caption"].strip()
+                if image_paths and has_caption and isinstance(payload.get("on_screen_caption"), str)
+                else ""
+            ),
         }
 
     def _normalize_text_bands(self, value: Any) -> list[dict[str, float]]:
@@ -556,9 +599,9 @@ class ClipAIService:
         return combined
 
     def _pick_kick_overlay_y(self, run_dir: Path | None, visual: dict[str, Any]) -> float | None:
-        """Gemini says which numbered strip positions (all inside the configured range) hide nothing important.
+        """Gemini ranks clear numbered strip positions inside the configured range.
 
-        Returns the clear position nearest the configured spot as a fraction (y = (H - h) * fraction), or None
+        Returns the highest-ranked clear position as a fraction (y = (H - h) * fraction), or None
         when nothing is confirmed clear, so the editor falls back to its own placement.
         """
         from PIL import Image
@@ -569,27 +612,29 @@ class ClipAIService:
         if overlay_path is None or not frames:
             return None
         with Image.open(overlay_path) as overlay, Image.open(frames[0]) as frame:
-            strip_height = kick_placement.OUTPUT_WIDTH * overlay.height / overlay.width
+            strip_height = round(kick_placement.OUTPUT_WIDTH * overlay.height / overlay.width)
             layout = kick_placement.Layout(frame.width, frame.height, strip_height)
         top_y, bottom_y = self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y
-        bands = visual.get("caption_bands") or []
         caption_position = str(visual.get("caption_position") or "NONE")
-        # Same rule as the editor: the watermark uses its "top" setting when captions sit at the bottom.
-        keep_out = kick_placement.watermark_span(
-            layout,
-            box=visual.get("source_watermark_box") if visual.get("has_source_watermark") else None,
-            watermark_y=self.config.watermark_top_y if caption_position == "BOTTOM" else self.config.watermark_bottom_y,
-            size=self.config.watermark_size,
-            opacity=self.config.watermark_opacity,
-        )
-        fractions = kick_placement.candidate_fractions(layout, top_y, bottom_y, bands, [keep_out] if keep_out else [])
+        fractions = kick_placement.candidate_fractions(layout, top_y, bottom_y)
+        visual["kick_overlay_candidates"] = [round(fraction, 4) for fraction in fractions]
         if not fractions:
-            logger.info("Every Kick overlay spot in range overlaps the account watermark for %s.", run_dir.name)
+            logger.warning("No Kick overlay positions fit the output geometry for %s.", run_dir.name)
             return None
-        sheet = kick_placement.draw_candidates(frames, layout, fractions, run_dir / "ai" / "kick_candidates.jpg")
+        _, staggered = kick_placement.placement_grids(layout, top_y, bottom_y)
+        kick_placement.draw_candidates(
+            frames, layout, fractions, run_dir / "ai" / "kick_candidates.jpg", staggered=staggered,
+        )
         prompt = self._fill_prompt(
             self._read_prompt_template("kick_placement.txt"),
             {"FRAME_COUNT": str(len(frames)), "CANDIDATE_COUNT": str(len(fractions))},
+        )
+        watermark_y = self.config.watermark_top_y if caption_position == "BOTTOM" else self.config.watermark_bottom_y
+        prompt += (
+            f"\nAccount watermark on 1080x1920 output: opacity={self.config.watermark_opacity}, "
+            f"font_height={round(self.config.watermark_size * 1920)}px, top Y=(1920-font_height)*{watermark_y}. "
+            f"If present, this normalized source box instead anchors its center after fitting: "
+            f"{visual.get('source_watermark_box') if visual.get('has_source_watermark') else None}.\n"
         )
         schema = {
             "type": "OBJECT",
@@ -602,47 +647,47 @@ class ClipAIService:
                             "number": {"type": "INTEGER"},
                             "covers": {"type": "STRING"},
                             "clear": {"type": "BOOLEAN"},
+                            "confidence": {"type": "NUMBER"},
                         },
-                        "required": ["number", "covers", "clear"],
-                        "propertyOrdering": ["number", "covers", "clear"],
+                        "required": ["number", "covers", "clear", "confidence"],
+                        "propertyOrdering": ["number", "covers", "clear", "confidence"],
                     },
                 },
-                "confidence": {"type": "NUMBER"},
+                "ranked_clear_boxes": {"type": "ARRAY", "items": {"type": "INTEGER"}},
             },
-            "required": ["boxes", "confidence"],
-            "propertyOrdering": ["boxes", "confidence"],
+            "required": ["boxes", "ranked_clear_boxes"],
+            "propertyOrdering": ["boxes", "ranked_clear_boxes"],
         }
-        payload = self._call_gemini(
-            prompt, response_schema=schema, image_paths=[sheet], model=self.config.watermark_model, temperature=0.0
-        )
-        confidence = self._normalize_confidence(payload.get("confidence"))
-        labels = [item for item in payload.get("boxes") or [] if isinstance(item, dict)]
-        logger.info(
-            "Kick overlay spots for %s: %s",
-            run_dir.name,
-            "; ".join(
-                f"#{item.get('number')} ({self._fraction_label(fractions, item.get('number'))}) "
-                f"{'clear' if item.get('clear') is True else 'blocked'}: {item.get('covers')}"
-                for item in labels
-            ),
-        )
-        clear = []
-        for item in labels:
-            try:
-                number = int(item.get("number"))
-            except (TypeError, ValueError):
-                continue
-            if item.get("clear") is True and 1 <= number <= len(fractions):
-                clear.append(fractions[number - 1])
-        if not clear or confidence < 0.7:
-            logger.info(
-                "No confirmed clear Kick overlay spot for %s (clear=%s, confidence=%.2f); using the fallback position.",
-                run_dir.name, len(clear), confidence,
+        results = []
+        for index, frame in enumerate(frames, 1):
+            frame_sheet = kick_placement.draw_candidates(
+                [frame], layout, fractions, run_dir / "ai" / f"kick_frame_{index}.jpg", staggered=staggered,
             )
+            with Image.open(frame_sheet) as image:
+                for row, name in enumerate(("primary", "staggered")):
+                    image.crop((0, row * 972, 540, row * 972 + 960)).save(
+                        run_dir / "ai" / f"kick_frame_{index}_{name}.jpg", quality=95,
+                    )
+            results.append(self._call_gemini(
+                prompt, response_schema=schema,
+                image_paths=[run_dir / "ai" / f"kick_frame_{index}_{name}.jpg" for name in ("primary", "staggered")],
+                model=self.config.kick_placement_model, temperature=0.0,
+            ))
+        evidence = {"frames": results, "fractions": fractions}
+        evidence_path = run_dir / "ai" / "kick_placement_results.json"
+        evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        try:
+            ranking = kick_placement.aggregate_rankings(results, len(fractions))
+        except ValueError:
+            logger.exception("Invalid per-frame Kick placement assessments for %s; using fallback.", run_dir.name)
             return None
-        target = kick_placement.default_fraction(top_y, bottom_y, caption_position)
-        chosen = round(min(clear, key=lambda fraction: abs(fraction - target)), 4)
-        logger.info("Kick overlay for %s placed at %.4f (configured spot %.4f).", run_dir.name, chosen, target)
+        evidence["combined_ranking"] = ranking
+        evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        if not ranking:
+            logger.warning("No Kick position passed every sampled frame for %s; using fallback.", run_dir.name)
+            return None
+        chosen = round(fractions[ranking[0]["number"] - 1], 4)
+        logger.info("Kick overlay for %s placed at %.4f with combined score %.3f.", run_dir.name, chosen, ranking[0]["score"])
         return chosen
 
     @staticmethod
@@ -662,7 +707,7 @@ class ClipAIService:
             return None
         return output_path
 
-    def _analyze_clip_context(self, manifest: dict[str, Any], *, run_dir: Path) -> dict[str, Any]:
+    def _analyze_clip_context(self, manifest: dict[str, Any], *, run_dir: Path, on_screen_caption: str = "") -> dict[str, Any]:
         """One call: transcript plus whether the audio and caption describe a clear, specific event."""
         caption = self._summarize_context(manifest)
         video_path = self._source_video_path(run_dir)
@@ -677,17 +722,27 @@ class ClipAIService:
             "required": ["context_sufficient"],
         }
         try:
-            payload = self._call_gemini(
-                self._build_context_prompt(caption),
-                response_schema=schema,
-                audio_paths=[audio] if audio else None,
-                model=self.config.context_model,
-            )
+            for attempt in range(2):
+                try:
+                    payload = self._call_gemini(
+                        self._build_context_prompt(caption, on_screen_caption),
+                        response_schema=schema,
+                        audio_paths=[audio] if audio else None,
+                        model=self.config.context_model,
+                        max_output_tokens=4096,
+                        thinking_budget=0 if self.config.context_model.startswith("gemini-2.5-flash") else None,
+                    )
+                    break
+                except GeminiTruncatedResponseError:
+                    if attempt:
+                        raise
+                    logger.warning("Gemini audio/context response was truncated; retrying once with the same bounded settings.")
         finally:
             if audio is not None:
                 audio.unlink(missing_ok=True)
         return {
             "caption": caption,
+            "on_screen_caption": on_screen_caption,
             "transcript": str(payload.get("transcript") or "").strip(),
             "context_sufficient": bool(payload.get("context_sufficient", False)),
             "hashtags": self._normalize_hashtags(payload.get("person_hashtags")),
@@ -702,9 +757,9 @@ class ClipAIService:
                 tags.append(tag)
         return tags[:2]
 
-    def _generate_summary(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+    def _generate_summary(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         payload = self._call_gemini(
-            self._build_summary_prompt(caption, transcript, context_sufficient), plain_text=True
+            self._build_summary_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True
         )
         summary = str(payload.get("text") or "").replace("\r", "\n").strip()
         if not summary:
@@ -712,9 +767,9 @@ class ClipAIService:
         parts = [re.sub(r"\s+", " ", part).strip() for part in re.split(r"\n\s*\n", summary)]
         return "\n\n".join(part for part in parts if part)
 
-    def _generate_youtube_description(self, caption: str, transcript: str, context_sufficient: bool) -> str:
+    def _generate_youtube_description(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         payload = self._call_gemini(
-            self._build_youtube_prompt(caption, transcript, context_sufficient), plain_text=True
+            self._build_youtube_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True
         )
         text = str(payload.get("text") or "").replace("\r", "\n").strip()
         if not text:
@@ -735,7 +790,8 @@ class ClipAIService:
         description = fallback_description
         try:
             description = self._generate_youtube_description(
-                clip_context["caption"], clip_context["transcript"], clip_context["context_sufficient"]
+                clip_context["caption"], clip_context["transcript"], clip_context["context_sufficient"],
+                on_screen_caption=clip_context.get("on_screen_caption", ""),
             )
         except Exception:
             logger.exception("Could not generate the YouTube description for %s; using the Instagram summary instead.", run_dir.name)
@@ -781,6 +837,7 @@ class ClipAIService:
             logger.info("No archive at %s; nothing to backfill.", archive)
             return 0
         for run_dir in sorted(path for path in archive.iterdir() if path.is_dir()):
+            self.config = config_for_run(self._base_config, run_dir)
             publish = _read_json(run_dir / "publisher" / "publish_state.json")
             if not isinstance(publish, dict) or publish.get("phase") != "published" or publish.get("status") not in {"success", "partial"}:
                 continue
@@ -807,6 +864,7 @@ class ClipAIService:
                 "caption": self._summarize_context(manifest if isinstance(manifest, dict) else {}),
                 "transcript": transcript_path.read_text(encoding="utf-8").strip() if transcript_path.exists() else "",
                 "context_sufficient": bool(analysis.get("context_sufficient", False)),
+                "on_screen_caption": str(analysis.get("on_screen_caption") or ""),
             }
             fallback = str(analysis.get("summary") or "") or (summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else "")
             (run_dir / "ai").mkdir(exist_ok=True)
@@ -820,6 +878,7 @@ class ClipAIService:
 
     def process_once(self) -> bool:
         for run_dir in self._ready_items():
+            self.config = config_for_run(self._base_config, run_dir)
             state = self._load_state(run_dir)
             if state.get("phase") == "ai_processed":
                 continue
@@ -837,9 +896,13 @@ class ClipAIService:
             caption_bands = self._normalize_text_bands(visual.get("caption_bands")) if has_caption else []
             has_source_watermark = bool(visual.get("has_source_watermark", False))
             source_watermark_box = visual.get("source_watermark_box") if has_source_watermark else None
-            clip_context = self._analyze_clip_context(manifest, run_dir=run_dir)
+            on_screen_caption = str(visual.get("on_screen_caption") or "")
+            clip_context = self._analyze_clip_context(manifest, run_dir=run_dir, on_screen_caption=on_screen_caption)
             context_sufficient = clip_context["context_sufficient"]
-            summary = self._generate_summary(clip_context["caption"], clip_context["transcript"], context_sufficient)
+            summary = self._generate_summary(
+                clip_context["caption"], clip_context["transcript"], context_sufficient,
+                on_screen_caption=on_screen_caption,
+            )
             hashtags = clip_context["hashtags"]
             (ai_dir / "transcript.txt").write_text(clip_context["transcript"], encoding="utf-8")
             platforms = read_slot_platforms(self.config.queue_dir)
@@ -853,7 +916,9 @@ class ClipAIService:
                 "has_caption": has_caption,
                 "caption_position": caption_position,
                 "caption_bands": caption_bands,
+                "on_screen_caption": on_screen_caption,
                 "kick_overlay_y": visual.get("kick_overlay_y") if not has_kick_overlay else None,
+                "kick_overlay_candidates": visual.get("kick_overlay_candidates", []),
                 "has_source_watermark": has_source_watermark,
                 "source_watermark_box": source_watermark_box,
                 "context_sufficient": context_sufficient,

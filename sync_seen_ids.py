@@ -1,10 +1,10 @@
 """Append locally published clip IDs to a production profile's seen history (never removes IDs).
 
 Local use (pushes this machine's seen IDs for the profile to production over SSH):
-    python sync_seen_ids.py --n3on [--dry-run]
+    python sync_seen_ids.py --carootclips [--dry-run]
 
 Server side (invoked by the push over SSH; reads JSON clip IDs from standard input):
-    python sync_seen_ids.py --n3on --merge-stdin [--dry-run]
+    python sync_seen_ids.py --carootclips --merge-stdin [--dry-run]
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT / "apps" / "Common" / "src"))
 
-from common.env import load_app_env  # noqa: E402
+from common.env import available_accounts, load_app_env  # noqa: E402
 
 CLIP_ID = re.compile(r"^\d{6,30}$")
 DEFAULT_KEY = Path.home() / ".ssh" / "clipper-ec2.pem"
@@ -31,7 +31,7 @@ REMOTE_PYTHON = "/home/ubuntu/venv/bin/python"
 
 
 def discover_profiles() -> list[str]:
-    return sorted(path.stem.lower() for path in (REPO_ROOT / "profiles").glob("*.env") if not path.stem.endswith(".local"))
+    return available_accounts(REPO_ROOT)
 
 
 def resolve_state_file(profile: str) -> Path:

@@ -1,5 +1,28 @@
 # ClipPublisher
 
+Success emails keep their existing subjects and provide a readable HTML layout
+with a plain-text alternative. The publish ID and next scheduled run come first,
+followed by **Source**, **Apify**, and **Editor** sections. Source includes the
+original clickable TikTok link, recorded TikTok views, clip age in hours at notification
+time, creator name, and original caption (not the generated publishing caption). Schedule times
+use the profile's `TIMEZONE_NAME`, displayed as `YYYY-MM-DD HH:MM:SS` without a timezone suffix.
+
+Apify shows requests (scraped clips returned), estimated CAD cost at $4.26 per
+1,000 clips, and the live candidate-cache count. Shared-platform emails show the same
+run total, not an additional charge per platform. YouTube replay runs use no Apify
+requests. Failure emails retain their existing diagnostics and usage details.
+Old queue items without usage or source metadata show unknown values rather than guesses.
+
+Editor branding is `Original` when the original Kick branding was retained, or
+`Manual [6]` (for example) when the editor applied numbered position 6 from the
+clip's `ai/kick_candidates.jpg`. The AI records candidate positions in
+`ai/analysis.json`; the editor saves the actual rendered position and matching
+number in `editor/branding.json`. Candidate counts depend on the available space,
+overlay size, captions and watermark; numbering is not forced to six if the actual
+candidate set differs. An unnumbered editor fallback is explicitly reported as
+`Manual [unavailable: unnumbered fallback]`; older items without branding records
+show unknown rather than inventing a placement.
+
 Simple queue consumer for post-processing ClipSourcer output and publishing ready short-form videos to Instagram.
 
 ## Best automation approach
@@ -42,6 +65,16 @@ The app then claims the item in place by setting its `queue_state.json` phase to
 
 This gives a simple safety check so the Publisher does not pick up a half-written queue item.
 
+Before any YouTube upload, Gemini reviews the outgoing title, captions, summary and available `ai/transcript.txt` in context for likely YouTube Community Guidelines violations. There are no keyword blocklists. The review distinguishes policy concerns from ordinary profanity, gameplay, jokes and reporting; monetization suitability alone is not a reason to reject. Only an explicit AI `allow` decision permits upload. `block` or `review` excludes a replay candidate so the next-highest-view eligible clip is selected, with the AI reason recorded in the plan's exclusions. AI outages, missing credentials and invalid responses block publishing rather than being treated as policy decisions; preparation retries without finalizing an unchecked plan. Instagram is unaffected.
+
+Screening uses the existing `GOOGLE_API_KEY`, `GEMINI_MODEL` (default `gemini-2.5-flash-lite`) and `TIMEOUT_SECONDS` (default `180`) settings, which must also be available to ClipPublisher. This lightweight text-only AI review cannot assess video imagery, establish copyright permission or guarantee full Terms of Service compliance.
+
+The screening prompt lives in `data/prompts/youtube_policy_screening.txt`, alongside the other AI prompts. `AI_PROMPTS_DIR` overrides that directory (relative paths resolve from the repository root). Missing or empty prompts block screening; there is no hardcoded fallback. Changing the prompt invalidates an approval obtained with the previous text.
+
+Replay plans retain ranked reserve candidates. If a selected clip is rejected by AI at publish time, its slot is filled from the next-highest-view reserve, without consuming an upload attempt for the rejected clip. If AI screening is unavailable, the slot stays pending. Older plans without reserves still block rejected clips but cannot backfill that slot.
+
+AI policy rejections send a YouTube-tagged `Rejected` email using the existing `ALERT_EMAIL_*` settings, including the clip ID, a short AI reason and whether another candidate will be considered or reserves are exhausted. This applies during replay preparation and before upload; read-only simulations do not send rejection alerts. Email delivery failures are logged and do not stop replacement selection.
+
 ## YouTube replay of yesterday's best Instagram clips
 
 `clippublisher.youtube_replay.YouTubeReplay(config)` replays yesterday's most-viewed Instagram clips to YouTube. ClipScheduler drives it (loading the Publisher `AppConfig` lazily):
@@ -53,20 +86,24 @@ Both files are written atomically in `QUEUE_DIR`. Publish states now also record
 
 Preparation completes only when every eligible clip has a known views count. Missing metrics and unavailable insights now return `False` for retry, even if other clips have known counts; they are not excluded to produce an incomplete ranking. All-missing insights do not create an empty completed plan. An actual reported count of zero is valid.
 
-Replay honors `YOUTUBE_POSTS_PER_DAY` (default `0`, disabled), `YOUTUBE_SELECTION_MODE` (default `shared`), and `YOUTUBE_SCHEDULE_START_HOUR`/`YOUTUBE_SCHEDULE_END_HOUR` (defaults `10`/`12`). At or after the end hour, remaining pending entries become `failed` with a `missed_window` error without uploading or adding upload history. Daily attempt counts in both plan and history enforce the quota. Plans persist `profile` and `instagram_user_id`; a same-day snapshot from another account, or without account identity, blocks preparation and uploads rather than being reused or reranked. Keep each profile's queue separate.
+Replay honors each creator's YouTube quota in the account's `CREATORS=name:ig_daily:yt_daily,...` mapping. `YOUTUBE_POSTS_PER_DAY` is now derived internally, not configured separately. Ranking is per creator; selected clips are shuffled into one account schedule, and reserve replacements must match the scheduled creator. A creator with too few eligible clips does not donate quota to another. `YOUTUBE_SELECTION_MODE` defaults to `shared`; `YOUTUBE_SCHEDULE_START_HOUR`/`YOUTUBE_SCHEDULE_END_HOUR` default to `10`/`12`. At the end hour pending entries fail with `missed_window`, without uploading or adding upload history. Plans persist account selector `profile` and `instagram_user_id`; mismatched plans block reuse. Keep each account's queue separate.
 
 `INSTAGRAM_INSIGHTS_API_VERSION` pins the dedicated insights endpoint (default `v24.0`; accepts `v23.0` or newer). It does not change the existing Instagram publishing API version. Token and permission failures block preparation for retry after credentials/permissions are repaired; there is no random or zero-view fallback.
 
 Plan entries expose `scheduled_for` (ISO datetime; `slot` is retained for compatibility), `status` (`pending`, `attempted`, `published`, or `failed`), `clip_id`, `media_id`, `run_dir`, `views`, `instagram_published_at`, and `rank`. Account-matched older snapshots with `slot` and `planned` remain usable without re-ranking. When an archived clip has no editor description, replay metadata uses `ai/summary.txt`; dedicated YouTube metadata and nonempty editor descriptions still take precedence. No new AI generation is required.
 
-ClipPublisher calls `process_due` itself on every poll (`run_forever`) and before each `--once` run, only when `YOUTUBE_SELECTION_MODE=instagram_top` (set by the profiles), `CLIPPER_TEST_MODE` is off and `CLIPPER_PUBLISH_ONLY` is not `instagram`. ClipScheduler only calls `prepare`. In that mode shared queue items are never uploaded to YouTube, even if a slot lists it; the default `shared` mode keeps the previous behavior. Replay errors are logged and never block the Instagram queue. Queue discovery only looks at run directories, so the plan/history files (and their temp/backup files) in `QUEUE_DIR` are ignored.
+ClipPublisher calls `process_due` itself on every poll (`run_forever`) and before each `--once` run, only when `YOUTUBE_SELECTION_MODE=instagram_top` (set by the profiles) and `CLIPPER_TEST_MODE` is off. Replay uploads require a positive YouTube quota. ClipScheduler only calls `prepare`. In that mode shared queue items are never uploaded to YouTube, even if a slot lists it; the default `shared` mode keeps the previous behavior. Replay errors are logged and never block the Instagram queue. Queue discovery only looks at run directories, so the plan/history files (and their temp/backup files) in `QUEUE_DIR` are ignored.
 
 ## Required config
 
-Copy `.env.example` to `.env` and set:
+Copy `accounts\template.env.example` to `accounts\<account>.env` for account credentials and creator quotas. Shared Publisher settings remain in this app's `.env` (copy `.env.example`) or the root `.env`. Queue/state/token paths default to `data\state\{ACCOUNT_NAME}`; override only when needed, such as preserving existing paths. Creator-specific hashtags come from the queued `creator.json` snapshot.
+
+Relevant settings:
 
 - `QUEUE_DIR` — the directory that ClipSourcer writes to, for example `../../data/queue`
 - `INSTAGRAM_USER_ID` — your Instagram Business account user ID
+- `INSTAGRAM_CAPTION_FILE` — optional UTF-8 file, relative to the repository root or absolute. Its exact text replaces the Instagram caption for every post, with no generated text, prefix or hashtags. Empty files or captions over 2200 characters fail explicitly.
+- `INSTAGRAM_COVER_IMAGE` — optional local JPEG file, relative to the repository root or absolute. Served unchanged as the reel cover through the same R2 or public media hosting as the video. Invalid/non-JPEG images or covers over 8 MB fail explicitly. Without it, Instagram's default video thumbnail is unchanged.
 - `INSTAGRAM_ACCESS_TOKEN` — a valid Meta user token with permission to publish to Instagram
 - `FACEBOOK_APP_ID` — your Meta app ID (required for automatic token refresh)
 - `FACEBOOK_APP_SECRET` — your Meta app secret (required for automatic token refresh)
@@ -80,6 +117,13 @@ Copy `.env.example` to `.env` and set:
 - `ALERT_EMAIL_*` — optional SMTP settings for publish-success and failure alert emails
 
 ## Meta setup (specific steps)
+
+The local `kickzsclipz` account uses `data/captions/kickzsclipz_instagram.txt` for its
+fixed caption and `data/assets/kickzsclipz_instagram_cover.jpg` for its reel cover,
+with Instagram-only scheduling through its `CREATORS=cuffem:8:0` quotas. Other accounts keep generated captions and default
+thumbnails unless these optional overrides are explicitly configured. When provisioning
+this account on another host, deploy both assets, install Publisher requirements, and
+set the same optional settings in that host's account env; do not copy local secrets.
 
 1. In Meta for Developers, create/select your app and add **Facebook Login** + **Instagram Graph API**.
 2. Add your account as a tester/developer role in the app while testing.
@@ -101,8 +145,8 @@ This exchanges/persists a long-lived token into `TOKEN_STATE_FILE`. After that, 
 From the repository root, select the account explicitly:
 
 ```powershell
-python apps\ClipPublisher\main.py --refresh-token --n3on --token=TOKEN
-python apps\ClipPublisher\main.py --refresh-token --navaeh --token-prompt
+python apps\ClipPublisher\main.py --refresh-token --carootclips --token-prompt
+python apps\ClipPublisher\main.py --refresh-token --vrlclipmoments --token-prompt
 ```
 
 `--token-prompt` reads the replacement without displaying it or putting it in shell history.
@@ -151,6 +195,11 @@ Important:
 - The publisher is tuned for a conservative creator-style cadence by default: 1 post per day, evening local-time window, and a persisted randomized daily publish time.
 
 ## Run the app
+
+With `run_all_apps.py --<account> --stop-after publisher`, the scheduler waits through
+the `publishing` phase until Publisher has saved the result and completed archiving.
+Claiming a clip is not completion; a failed publish signals `publish_failed` so the
+one-cycle launcher exits with failure instead of reporting success.
 
 ```powershell
 python main.py --once

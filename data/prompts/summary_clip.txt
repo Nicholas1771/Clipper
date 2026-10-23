@@ -2,13 +2,13 @@ Write 3 long paragraphs (3-4 sentences each, 9-12 sentences total) for ig descri
 
 Rules:
 Do not use " to quote from the caption or transcript.
-Use names or handles of the relevant people as they appear in the caption/transcript.
+Use all names and titles as they appear in the caption. Do not "@mention" or tag anyone in the description, if the caption uses @, use their known name instead.
 Do not use emojis or headers.
 Do not use terms like "ig", "description", "caption", or "transcript", etc.
 Separate paragraphs by a blank line.
 
-Caption:
-"__CAPTION__"
+Caption: "__CAPTION__"
+on-screen caption: "__ON_SCREEN_CAPTION__"
 
 Transcript:
 "__TRANSCRIPT__"

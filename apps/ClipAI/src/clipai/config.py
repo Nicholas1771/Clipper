@@ -18,11 +18,12 @@ class AppConfig:
     prompts_dir: Path | None = None
     overlay_reference_image_path: Path | None = None
     watermark_model: str = "gemini-2.5-flash"
+    kick_placement_model: str = "gemini-3.1-pro-preview"
     context_model: str = "gemini-2.5-flash"
     streamer_name: str = ""
     youtube_selection_mode: str = "shared"
-    kick_overlay_top_y: float = 0.26
-    kick_overlay_bottom_y: float = 0.74
+    kick_overlay_top_y: float = 0.1
+    kick_overlay_bottom_y: float = 0.8
     watermark_top_y: float = 0.5
     watermark_bottom_y: float = 0.5
     watermark_size: float = 0.02
@@ -53,6 +54,7 @@ class AppConfig:
             prompts_dir=prompts_dir if prompts_dir.exists() else None,
             overlay_reference_image_path=overlay_path if overlay_path.exists() else None,
             watermark_model=os.getenv("WATERMARK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
+            kick_placement_model=os.getenv("KICK_PLACEMENT_MODEL", "gemini-3.1-pro-preview").strip() or "gemini-3.1-pro-preview",
             streamer_name=os.getenv("STREAMER_NAME", "").strip(),
             context_model=os.getenv("CONTEXT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             youtube_selection_mode=os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip().lower() or "shared",
@@ -71,12 +73,11 @@ def _placement_settings(root_dir: Path) -> dict[str, float]:
         except ValueError:
             return default
 
-    watermark_y = value("WATERMARK_Y", 0.5)
     return {
-        "kick_overlay_top_y": value("KICK_OVERLAY_TOP_Y", 0.26),
-        "kick_overlay_bottom_y": value("KICK_OVERLAY_BOTTOM_Y", 0.74),
-        "watermark_top_y": value("WATERMARK_TOP_Y", watermark_y),
-        "watermark_bottom_y": value("WATERMARK_BOTTOM_Y", watermark_y),
+        "kick_overlay_top_y": value("KICK_OVERLAY_TOP_Y", 0.1),
+        "kick_overlay_bottom_y": value("KICK_OVERLAY_BOTTOM_Y", 0.8),
+        "watermark_top_y": value("WATERMARK_TOP_Y", 0.5),
+        "watermark_bottom_y": value("WATERMARK_BOTTOM_Y", 0.5),
         "watermark_size": value("WATERMARK_SIZE", 0.02),
         "watermark_opacity": value("WATERMARK_OPACITY", 0.42),
     }

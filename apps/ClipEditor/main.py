@@ -17,6 +17,7 @@ from clipeditor.config import AppConfig
 from clipeditor.service import ClipEditorService
 from common.alerts import send_failure_alert
 from common.logging_utils import configure_app_logging
+from common.reporting import record_stage_failure
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     configure_logging()
+    config = None
     try:
         args = parse_args()
         config = AppConfig.from_repo_root(APP_ROOT)
@@ -48,6 +50,8 @@ def main() -> int:
         return 0
     except Exception as error:
         logger.exception("ClipEditor failed: %s", error)
+        if config is not None:
+            record_stage_failure(config.queue_dir, "ClipEditor", error)
         send_failure_alert(app_name="ClipEditor", error=error, context="runtime failure")
         return 1
 

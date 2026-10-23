@@ -14,6 +14,7 @@ from clippublisher import runner as runner_module
 from clippublisher import youtube_replay as replay_module
 from clippublisher.config import AppConfig
 from clippublisher.youtube_replay import GRAPH_API_VERSION, YouTubeReplay
+from common.creators import Creator
 
 NY = ZoneInfo("America/New_York")
 NOW = datetime(2026, 10, 14, 0, 30, tzinfo=NY)
@@ -63,6 +64,7 @@ def archive(queue, name, *, clip_id, media_id="", when=YESTERDAY_NOON, style="le
 
 def make_config(queue):
     config = mock.MagicMock(spec=AppConfig)
+    config.creators = ()
     config.queue_dir = queue
     config.timezone_name = "America/New_York"
     config.instagram_insights_api_version = GRAPH_API_VERSION
@@ -89,9 +91,10 @@ class ReplayTestCase(unittest.TestCase):
         self.views = {}
         self.get = mock.Mock(side_effect=self._fake_get)
         self.token = mock.Mock(return_value="ig-token")
-        self.upload = mock.Mock(side_effect=lambda config, item: {"id": f"yt-{item.clip_id}", "url": f"https://youtube.com/shorts/yt-{item.clip_id}"})
+        self.upload = mock.Mock(side_effect=lambda config, item, **kwargs: {"id": f"yt-{item.clip_id}", "url": f"https://youtube.com/shorts/yt-{item.clip_id}"})
         self.posted = mock.Mock()
         self.failed = mock.Mock()
+        self.screen = mock.Mock()
         self.ig = mock.Mock(side_effect=AssertionError("Instagram must never be called"))
         forbidden = mock.Mock(side_effect=AssertionError("unexpected live HTTP call"))
         for patcher in [
@@ -100,6 +103,7 @@ class ReplayTestCase(unittest.TestCase):
             mock.patch.object(requests, "put", forbidden),
             mock.patch.object(replay_module, "resolve_publish_access_token", self.token),
             mock.patch.object(replay_module, "publish_to_youtube", self.upload),
+            mock.patch.object(replay_module, "screen_youtube_content", self.screen),
             mock.patch.object(replay_module, "youtube_is_configured", lambda config: True),
             mock.patch.object(replay_module, "send_posted_alert", self.posted),
             mock.patch.object(replay_module, "send_failure_alert", self.failed),
@@ -129,6 +133,115 @@ class ReplayTestCase(unittest.TestCase):
 
 
 class PrepareTests(ReplayTestCase):
+    def creator_archives(self):
+        self.replay.config.creators = (
+            Creator("one", 2, 1, {"STREAMER_NAME": "One"}),
+            Creator("two", 2, 1, {"STREAMER_NAME": "Two"}),
+        )
+        self.replay.config.youtube_posts_per_day = 2
+        for creator, scores in (("one", (100, 80)), ("two", (1000, 900))):
+            for suffix, score in zip(("a", "b"), scores):
+                name = creator + suffix
+                run = archive(self.queue, name, clip_id=name, media_id=name)
+                (run / "creator.json").write_text(json.dumps({
+                    "name": creator, "display_name": creator.title(),
+                    "settings": {"STREAMER_HASHTAG": creator},
+                }))
+                self.views[name] = score
+
+    def test_creator_youtube_quotas_do_not_allow_global_top_clips_to_take_over(self):
+        self.creator_archives()
+        self.assertTrue(self.replay.prepare(NOW, slots(9, 10)))
+        entries = self.plan()["entries"]
+        self.assertEqual({entry["clip_id"] for entry in entries}, {"onea", "twoa"})
+        self.assertEqual({entry["creator_name"] for entry in entries}, {"One", "Two"})
+
+    def test_creator_without_eligible_posts_does_not_donate_quota(self):
+        self.creator_archives()
+        for name in ("onea", "oneb"):
+            (self.queue / "Archive" / name / "publisher" / "publish_state.json").unlink()
+        self.assertTrue(self.replay.prepare(NOW, slots(9, 10)))
+        self.assertEqual([entry["clip_id"] for entry in self.plan()["entries"]], ["twoa"])
+
+    def test_rejected_creator_slot_uses_its_own_reserve_even_when_other_creator_has_more_views(self):
+        self.creator_archives()
+        with mock.patch.object(replay_module.random.SystemRandom, "shuffle", side_effect=lambda rows: rows.sort(key=lambda row: row["creator"])):
+            self.assertTrue(self.replay.prepare(NOW, slots(9, 10)))
+
+        def screen(config, item):
+            if item.clip_id == "onea":
+                raise replay_module.YouTubePolicyError("AI rejected this clip")
+
+        self.screen.side_effect = screen
+        self.assertTrue(self.replay.process_due(NOW.replace(hour=9)))
+        self.assertEqual(self.upload.call_args.args[1].clip_id, "oneb")
+
+    def test_ai_screen_excludes_transcript_violation_and_uses_next_highest_views(self):
+        risky = archive(self.queue, "risky", clip_id="risky", media_id="m-risky")
+        (risky / "ai").mkdir()
+        (risky / "ai" / "transcript.txt").write_text("Send me your password for a free reward.", encoding="utf-8")
+        archive(self.queue, "next", clip_id="next", media_id="m-next")
+        archive(self.queue, "third", clip_id="third", media_id="m-third")
+        self.views = {"m-risky": 1000, "m-next": 800, "m-third": 700}
+
+        def screen(config, item):
+            if item.clip_id == "risky":
+                self.assertIn("Send me your password", item.transcript)
+                raise replay_module.YouTubePolicyError("AI identified credential phishing.")
+
+        self.screen.side_effect = screen
+        self.assertTrue(self.replay.prepare(NOW, slots(9)))
+
+        plan = self.plan()
+        self.assertEqual(["next"], [entry["clip_id"] for entry in plan["entries"]])
+        self.assertEqual(["third"], plan["unscheduled"])
+        self.assertIn("youtube_ai_policy", plan["excluded"][0]["reason"])
+        self.assertIn("credential phishing", plan["excluded"][0]["reason"])
+        fetched = {call.args[0].split("/")[-2] for call in self.get.call_args_list}
+        self.assertNotIn("m-risky", fetched)
+        self.failed.assert_called_once()
+        alert = self.failed.call_args.kwargs
+        self.assertEqual("YouTube", alert["platform"])
+        self.assertEqual("Rejected - risky", alert["subject"])
+        self.assertIn("credential phishing", str(alert["error"]))
+        self.assertIn("next-highest-view", alert["details"])
+
+    def test_simulation_does_not_send_policy_rejection_emails(self):
+        archive(self.queue, "a", clip_id="a", media_id="ma")
+        self.screen.side_effect = replay_module.YouTubePolicyError("AI found a policy concern.")
+        with mock.patch.object(replay_module, "read_access_token", return_value="ig-token"):
+            plan = self.replay.simulate(NOW, slots(9))
+        self.assertEqual([], plan["entries"])
+        self.failed.assert_not_called()
+
+    def test_policy_alert_failure_does_not_prevent_next_candidate_selection(self):
+        archive(self.queue, "a", clip_id="a", media_id="ma")
+        archive(self.queue, "b", clip_id="b", media_id="mb")
+        self.views = {"mb": 20}
+        def screen(config, item):
+            if item.clip_id == "a":
+                raise replay_module.YouTubePolicyError("AI found a policy concern.")
+
+        self.screen.side_effect = screen
+        self.failed.side_effect = RuntimeError("SMTP unavailable")
+        with self.assertLogs(replay_module.logger, "ERROR"):
+            self.assertTrue(self.replay.prepare(NOW, slots(9)))
+        self.assertEqual("b", self.plan()["entries"][0]["clip_id"])
+
+    def test_ai_outage_does_not_finalize_plan_or_mark_clips_as_violations(self):
+        archive(self.queue, "a", clip_id="a", media_id="ma")
+        self.views = {"ma": 100}
+        self.screen.side_effect = replay_module.YouTubeScreeningError("AI unavailable")
+        with self.assertLogs(replay_module.logger, "ERROR"):
+            self.assertFalse(self.replay.prepare(NOW, slots(9)))
+        self.assertFalse(self.replay.plan_path.exists())
+        self.assertEqual([], self.history())
+        self.upload.assert_not_called()
+        self.failed.assert_not_called()
+        self.screen.side_effect = None
+        self.assertTrue(self.replay.prepare(NOW, slots(9)))
+        self.assertEqual(["a"], [entry["clip_id"] for entry in self.plan()["entries"]])
+
     def test_insights_version_is_configurable_and_publish_version_is_unchanged(self):
         config = make_config(self.queue)
         config.instagram_insights_api_version = "v23.0"
@@ -341,6 +454,58 @@ class PrepareTests(ReplayTestCase):
 
 
 class ProcessDueTests(ReplayTestCase):
+    def test_publish_time_ai_rejection_uses_next_highest_reserve_without_spending_quota(self):
+        for clip_id in ("a", "b", "c"):
+            archive(self.queue, f"run_{clip_id}", clip_id=clip_id, media_id=f"m{clip_id}")
+        self.views = {"ma": 30, "mb": 20, "mc": 10}
+        self.replay.config.youtube_posts_per_day = 1
+        self.assertTrue(self.replay.prepare(NOW, slots(9)))
+
+        def screen(config, item):
+            if item.clip_id in ("a", "b"):
+                raise replay_module.YouTubePolicyError("AI found targeted harassment.")
+
+        self.screen.side_effect = screen
+        self.assertTrue(self.replay.process_due(datetime(2026, 10, 14, 9, 1, tzinfo=NY)))
+        self.upload.assert_called_once()
+        self.assertEqual("c", self.upload.call_args.args[1].clip_id)
+        plan = self.plan()
+        self.assertEqual("c", plan["entries"][0]["clip_id"])
+        self.assertEqual(slots(9)[0].isoformat(), plan["entries"][0]["slot"])
+        self.assertEqual(["a", "b"], [entry["clip_id"] for entry in plan["excluded"]])
+        self.assertEqual(["c"], [entry["clip_id"] for entry in self.history()])
+        self.assertEqual(2, self.failed.call_count)
+        self.assertEqual(["a", "b"], [call.kwargs["clip_id"] for call in self.failed.call_args_list])
+        self.assertIn("targeted harassment", str(self.failed.call_args.kwargs["error"]))
+        self.assertIn("reserve: c (10 Instagram views)", self.failed.call_args.kwargs["details"])
+        restarted = YouTubeReplay(self.replay.config)
+        self.assertFalse(restarted.process_due(datetime(2026, 10, 14, 9, 2, tzinfo=NY)))
+
+    def test_publish_time_ai_outage_leaves_slot_pending_without_attempt(self):
+        self.prepared()
+        self.screen.side_effect = replay_module.YouTubeScreeningError("AI unavailable")
+        with self.assertLogs(replay_module.logger, "ERROR"):
+            self.assertFalse(self.replay.process_due(datetime(2026, 10, 14, 9, 1, tzinfo=NY)))
+        self.assertEqual("pending", self.plan()["entries"][0]["status"])
+        self.assertNotIn("attempted_at", self.plan()["entries"][0])
+        self.assertEqual([], self.history())
+        self.upload.assert_not_called()
+        self.failed.assert_not_called()
+        self.screen.side_effect = None
+        self.assertTrue(self.replay.process_due(datetime(2026, 10, 14, 9, 2, tzinfo=NY)))
+
+    def test_publish_time_ai_rejection_without_reserves_does_not_upload(self):
+        archive(self.queue, "run_a", clip_id="a", media_id="ma")
+        self.views = {"ma": 30}
+        self.assertTrue(self.replay.prepare(NOW, slots(9)))
+        self.screen.side_effect = replay_module.YouTubePolicyError("AI found a policy violation.")
+        self.assertFalse(self.replay.process_due(datetime(2026, 10, 14, 9, 1, tzinfo=NY)))
+        self.assertEqual("failed", self.plan()["entries"][0]["status"])
+        self.assertEqual([], self.history())
+        self.upload.assert_not_called()
+        self.failed.assert_called_once()
+        self.assertIn("No eligible reserve", self.failed.call_args.kwargs["details"])
+
     def prepared(self):
         archive(self.queue, "run_a", clip_id="a", media_id="ma")
         archive(self.queue, "run_b", clip_id="b", media_id="mb")
@@ -377,7 +542,7 @@ class ProcessDueTests(ReplayTestCase):
         self.prepared()
         seen = []
 
-        def upload(config, item):
+        def upload(config, item, **kwargs):
             seen.append(([entry["status"] for entry in self.plan()["entries"]], self.history()[0]["status"]))
             return {"id": "yt-a"}
 
@@ -561,7 +726,7 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.replay_cls.return_value.process_due.return_value = True
         self.ig = mock.Mock(return_value={"id": "ig1"})
         self.yt = mock.Mock(return_value={"id": "yt1", "url": "u"})
-        env = {key: value for key, value in os.environ.items() if key not in {"YOUTUBE_SELECTION_MODE", "CLIPPER_TEST_MODE", "CLIPPER_PUBLISH_ONLY"}}
+        env = {key: value for key, value in os.environ.items() if key not in {"YOUTUBE_SELECTION_MODE", "CLIPPER_TEST_MODE"}}
         for patcher in [
             mock.patch.dict("os.environ", env, clear=True),
             mock.patch.object(replay_module, "YouTubeReplay", self.replay_cls),
@@ -594,15 +759,10 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(["instagram"], list(state["published_at"]))
         self.assertEqual("ig1", replay_module.instagram_media_id(state["result"]))
 
-    def test_replay_disabled_in_test_mode_and_instagram_only_publish(self):
-        for extra in ({"CLIPPER_TEST_MODE": "1"}, {"CLIPPER_PUBLISH_ONLY": "instagram"}):
-            with mock.patch.dict("os.environ", {"YOUTUBE_SELECTION_MODE": "instagram_top", **extra}):
-                self.assertFalse(self.runner.process_youtube_replay())
+    def test_replay_disabled_in_test_mode(self):
+        with mock.patch.dict("os.environ", {"YOUTUBE_SELECTION_MODE": "instagram_top", "CLIPPER_TEST_MODE": "1"}):
+            self.assertFalse(self.runner.process_youtube_replay())
         self.replay_cls.assert_not_called()
-
-    def test_replay_runs_for_youtube_only_publish(self):
-        with mock.patch.dict("os.environ", {"YOUTUBE_SELECTION_MODE": "instagram_top", "CLIPPER_PUBLISH_ONLY": "youtube"}):
-            self.assertTrue(self.runner.process_youtube_replay())
 
     def test_replay_errors_do_not_block_the_queue(self):
         self.replay_cls.return_value.process_due.side_effect = RuntimeError("bad plan")

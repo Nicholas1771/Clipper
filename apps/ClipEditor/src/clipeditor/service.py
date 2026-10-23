@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from common.creators import config_for_run
+
 import json
 import logging
 import re
@@ -33,6 +35,7 @@ def write_json(path: Path, payload: dict) -> None:
 class ClipEditorService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._base_config = config
         self._tz = ZoneInfo(config.timezone_name)
 
     def _queue_state_path(self, run_dir: Path) -> Path:
@@ -182,9 +185,9 @@ class ClipEditorService:
         ai_fraction: Any = None,
         watermark_box: dict[str, Any] | None = None,
     ) -> str:
-        """Overlay y expression, always between KICK_OVERLAY_TOP_Y and KICK_OVERLAY_BOTTOM_Y and clear of our watermark.
+        """Honor AI's position within the configured range without content-based vetoes.
 
-        Order: ClipAI's confirmed clear spot; otherwise the target spot (middle of the range when captions sit at
+        Fallback only: the target spot (middle of the range when captions sit at
         top and bottom, else the configured top/bottom spot) moved to the nearest place clear of the caption text
         bands; otherwise the nearest place clear of the watermark only; otherwise the target spot.
         """
@@ -198,12 +201,15 @@ class ClipEditorService:
         ai_pick = None
         if isinstance(ai_fraction, (int, float)) and not isinstance(ai_fraction, bool):
             ai_pick = max(low, min(high, float(ai_fraction)))
+        if ai_pick is not None:
+            logger.info("Placing the Kick overlay at ClipAI's selected spot %.4f.", ai_pick)
+            return f"(H-h)*{ai_pick:.4f}"
 
         source_size = self._probe_video_size(source_video)
         overlay_size = self._probe_video_size(self.config.overlay_image_path)
         if source_size is None or overlay_size is None:
             return f"(H-h)*{ai_pick:.4f}" if ai_pick is not None else target_expr
-        overlay_height = target_width * overlay_size[1] / overlay_size[0]
+        overlay_height = round(target_width * overlay_size[1] / overlay_size[0])
         scale = min(target_width / source_size[0], target_height / source_size[1])
         offset_y = (target_height - source_size[1] * scale) / 2
         max_y = target_height - overlay_height
@@ -214,13 +220,11 @@ class ClipEditorService:
             return offset_y + fraction * source_size[1] * scale
 
         keep_out = self._watermark_rows(overlay_position, watermark_box, to_output, target_height)
-        # Gemini's band edges are approximate, so keep a clear safety gap around each text block.
-        margin = 0.025 * target_height
         text_rows: list[tuple[float, float]] = []
         bands = caption_bands if isinstance(caption_bands, list) else []
         for band in bands:
             try:
-                text_rows.append((to_output(float(band["top"])) - margin, to_output(float(band["bottom"])) + margin))
+                text_rows.append((to_output(float(band["top"])), to_output(float(band["bottom"]))))
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -235,9 +239,6 @@ class ClipEditorService:
             clear = [y for y in options if clear_of(y, rows)]
             return min(clear, key=lambda y: abs(y - goal * max_y)) / max_y if clear else None
 
-        if ai_pick is not None and clear_of(ai_pick * max_y, keep_out):
-            logger.info("Placing the Kick overlay at ClipAI's clear spot %.4f.", ai_pick)
-            return f"(H-h)*{ai_pick:.4f}"
         chosen = nearest(target, keep_out + text_rows)
         if chosen is None:
             chosen = nearest(target, keep_out)
@@ -314,13 +315,14 @@ class ClipEditorService:
         caption_bands: Any = None,
         caption_position: str = "",
         kick_overlay_fraction: Any = None,
-    ) -> None:
+    ) -> str | None:
         ffmpeg_exe = str(get_ffmpeg_exe())
         target_width = 1080
         target_height = 1920
         source_enhance = self._source_enhance_filters()
         source_cover = ""
         watermark_anchor = None
+        overlay_y = None
         if source_watermark_box:
             plan = self._plan_source_watermark_cover(
                 source_video, source_watermark_box, target_width=target_width, target_height=target_height
@@ -428,6 +430,7 @@ class ClipEditorService:
         if completed.returncode != 0:
             stderr = completed.stderr.strip() or completed.stdout.strip() or "unknown ffmpeg error"
             raise RuntimeError(f"Failed to overlay clip: {stderr[-600:]}")
+        return overlay_y
 
     def _ready_items(self) -> list[Path]:
         items: list[Path] = []
@@ -485,6 +488,7 @@ class ClipEditorService:
 
     def process_once(self) -> bool:
         for run_dir in self._ready_items():
+            self.config = config_for_run(self._base_config, run_dir)
             state = load_json(self._queue_state_path(run_dir))
             if state.get("phase") == "edited":
                 continue
@@ -503,7 +507,7 @@ class ClipEditorService:
             editor_dir = run_dir / "editor"
             editor_dir.mkdir(parents=True, exist_ok=True)
             edited_path = editor_dir / f"{video_path.stem}_edited.mp4"
-            self._render_edited_video(
+            overlay_y = self._render_edited_video(
                 video_path,
                 edited_path,
                 add_kick_overlay=add_kick_overlay,
@@ -513,6 +517,21 @@ class ClipEditorService:
                 caption_position=caption_position if has_caption else "",
                 kick_overlay_fraction=ai_state.get("kick_overlay_y"),
             )
+            branding: dict[str, Any] = {"mode": "Original" if not add_kick_overlay else "Manual"}
+            if add_kick_overlay:
+                branding["overlay_y"] = overlay_y
+                candidates = ai_state.get("kick_overlay_candidates") or []
+                branding["placement"] = next(
+                    (
+                        index for index, fraction in enumerate(candidates, start=1)
+                        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool)
+                        and overlay_y == f"(H-h)*{fraction:.4f}"
+                    ),
+                    None,
+                )
+                if branding["placement"] is None:
+                    logger.warning("Kick branding for %s used an unnumbered fallback position.", run_dir.name)
+            write_json(editor_dir / "branding.json", branding)
             self._write_metadata_files(run_dir, manifest)
             self._mark_edited(run_dir, edited_path)
             logger.info(

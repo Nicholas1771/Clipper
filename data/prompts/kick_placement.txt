@@ -1,15 +1,23 @@
-We will add a solid, opaque, full-width branding strip to this vertical video. It will completely hide whatever is underneath it for the whole clip.
+Choose a position for an opaque, full-width branding strip that hides everything inside its rectangle.
 
-The image shows __FRAME_COUNT__ frames from the same clip side by side. On every frame, the same numbered magenta boxes (1 to __CANDIDATE_COUNT__) mark the possible positions of the strip.
+The two images show the SAME video frame. Image 1 has the original grid; image 2 has the halfway-offset grid, numbered consecutively. There are __CANDIDATE_COUNT__ positions total. Judge each number only where it appears. Numbers are IDs, not preferences.
 
-For EVERY numbered box, look at what is inside that box in ALL of the frames and report:
-- covers: a short description of what the strip would hide at that position (for example "subtitle text KEEP", "eyes and nose", "hoodie and hands", "plain wall").
-- clear: false if, in ANY frame, the box touches any of:
-  - on-screen caption, subtitle or title text that was edited on top of the video (including any part of a line of it)
-  - a person's face from the eyebrows down to the chin
-  - an on-screen graphic added on top of the video: logo bug, scoreboard, chat, picture-in-picture, stream overlay
-  Otherwise clear is true. These are all CLEAR: clothing (including logos or words printed on clothing), hair,
-  neck, chest, hands, arms, microphones, products, furniture, walls, background, black letterbox bars, and any text that
-  physically exists in the scene (posters, signs, shirt prints, microphone brand names).
+Assess the exact pixels INSIDE every rectangle, including partial intersections:
+- Block faces (especially eyes and mouths), captions and their panels, readable interface text, and important logos/graphics.
+- Apply this equally to people in video, photos, thumbnails and inset panels. Hair alone, clothing, hands, furniture and unimportant background are allowed.
+- Mark ambiguous overlaps blocked. Ignore the magenta outlines and number labels themselves.
 
-Judge each box independently. Return only JSON with schema {"boxes": [{"number": integer, "covers": string, "clear": boolean}], "confidence": number}.
+Rank all clear positions by:
+1. Clearance from faces and text.
+2. Empty background or safe still-photo regions over active video.
+3. Just above/below captions with a small visible gap.
+4. Unimportant background/clothing over meaningful action.
+5. Avoid the account watermark described below.
+6. Final tie-breaker: higher for bottom captions, lower for top/middle captions, central for captions at both ends.
+
+A single frame cannot establish motion; do not assume an inset is still without visual evidence. No positions have been filtered by code.
+
+Return JSON only:
+{"boxes":[{"number":1,"covers":"actual content and overlap reason","clear":false,"confidence":0.95}],"ranked_clear_boxes":[]}
+
+Assess every number exactly once. Confidence (0-1) is per position: confidence that its clear/blocked judgment is correct. Rank every clear number exactly once, best first; exclude blocked numbers. Return an empty ranking if none are clear.

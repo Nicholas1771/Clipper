@@ -1,6 +1,23 @@
 # ClipSourcer
 
-Simple Python sourcer that polls TikTok for recent clips matching the active profile's hashtag, ranks them by a lightweight viral score, and writes the best new candidate into the shared queue before ClipPublisher's posting window opens.
+Accounts select reusable creators with `CREATORS=name:ig_daily:yt_daily,...` in
+`accounts\<account>.env`. Sourcing targets, filters, download authorization and branding
+live in ignored `creators\<name>.env` files (copy `creators\template.env.example`).
+The account scheduler assigns a creator to each randomized slot. Sourcing snapshots
+that identity to `creator.json` for downstream stages and notifications.
+
+`REQUIRE_SOURCE_KICK_BRANDING=true` requires the original downloaded clip to pass
+the same strict visual Kick detector used by ClipAI **before it can enter the
+candidate cache**. Missing branding is logged, skipped and remembered in attempted
+history; unverified candidates are never cached. Detector outages fail the attempt
+and may be retried, rather than permanently rejecting candidates. This uses shared
+Gemini settings from the AI/root envs and adds download/AI work when fetching a fresh
+batch. False allows sources without branding, with normal editor branding afterward.
+N3on uses false; Navaeh uses true. Existing cache scopes are invalidated when the
+branding policy changes; published seen history is not reset. Caches are isolated by
+account and creator; the account's seen history remains shared.
+
+Simple Python sourcer that polls TikTok for clips matching the scheduled creator, ranks them by a lightweight viral score, and writes the best new candidate into the account's shared queue. ClipScheduler is the only schedule owner; Sourcer no longer has an independent legacy daily schedule or sourcing cap. `--once` explicitly bypasses the scheduler for a single-creator account; multi-creator runs require an assigned scheduler slot.
 
 I chose **TikTok** as the default source because Instagram's official hashtag access is more restricted and requires reviewed business-style access, while TikTok sourcing is easier to stand up through Apify's scraper API.
 
@@ -39,22 +56,12 @@ I chose **TikTok** as the default source because Instagram's official hashtag ac
 | `LOOKBACK_HOURS` | max clip age | `4` |
 | `RESULTS_PER_PAGE` | items requested per poll | `25` |
 | `MINIMUM_VIEW_COUNT` | local minimum `playCount` required before a clip is eligible | `0` |
-| `QUEUE_DIR` | shared queue folder used by the pipeline | `data/queue` |
-| `OUTPUT_DIR` | optional override for the shared queue folder consumed by ClipPublisher | same as `QUEUE_DIR` |
-| `STATE_FILE` | sourced-ID state file | `data/state.json` |
-| `SOURCE_HISTORY_FILE` | daily sourcing history file | `data/source_history.json` |
-| `SOURCE_SCHEDULE_FILE` | persisted randomized schedule for the current sourcing day | `data/source_schedule.json` |
-| `CANDIDATE_CACHE_FILE` | persistent cache of eligible, unused Apify results | `data/candidate_cache.json` |
+| `QUEUE_DIR` | account queue folder used by every pipeline stage | `data/state/{ACCOUNT_NAME}/queue` |
+| `STATE_FILE` | successfully published seen-ID history | `data/state/{ACCOUNT_NAME}/state.json` |
+| `CANDIDATE_CACHE_FILE` | persistent cache of eligible unused results; `{CREATOR_NAME}` is expanded per slot | `data/state/{ACCOUNT_NAME}/candidate_cache_{CREATOR_NAME}.json` |
 | `APIFY_ACTOR_ID` | Apify actor slug for TikTok sourcing | `clockworks~tiktok-scraper` |
 | `DOWNLOAD_VIDEO_FILES` | request and download raw video files when the clip author is authorized | `false` |
 | `AUTHORIZED_DOWNLOAD_PROFILES` | comma-separated TikTok handles allowed for video download | empty |
-| `MAX_SOURCE_RUNS_PER_DAY` | max successful sourcing runs per local day | `1` |
-| `MIN_SOURCE_GAP_MINUTES` | minimum spacing between sourcing runs | `1200` |
-| `SOURCE_TARGET_POSTING_START_HOUR` | local posting-window start hour that sourcing should lead | `18` |
-| `SOURCE_LEAD_MINUTES` | target minutes before the posting window when sourcing should run | `30` |
-| `SOURCE_JITTER_MINUTES` | randomized variation around the lead-time target | `15` |
-| `SOURCE_GRACE_MINUTES` | how long the sourcer may still run after that day's randomized target time | `90` |
-| `SOURCE_TIMEZONE_NAME` | IANA timezone used for daily sourcing schedule | `America/New_York` |
 
 ## Authorized downloads
 
@@ -65,7 +72,7 @@ The best approach for raw video downloads is to source from your own profile, as
 3. set `AUTHORIZED_DOWNLOAD_PROFILES` to the same handle
 4. set `DOWNLOAD_VIDEO_FILES=true`
 
-When enabled, the app saves the raw video file next to the clip's JSON manifest inside a single numbered run folder under `OUTPUT_DIR` (for example `sourced_clips/0001_20261002T232000Z_winner_12345/...`) only if the selected clip belongs to one of the authorized handles.
+Set these authorization options in the creator env. When enabled, the app saves the raw video next to its JSON manifest inside a numbered run folder under `QUEUE_DIR`, only when the selected author is authorized.
 
 Download order:
 

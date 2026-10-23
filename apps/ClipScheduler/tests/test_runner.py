@@ -32,7 +32,6 @@ def make_runner(queue_dir: Path, seed: int = 1, **overrides) -> ClipSchedulerRun
         poll_interval_seconds=60,
         schedule_start_hour=10,
         schedule_end_hour=22,
-        schedule_peak_hour=17,
         instagram_posts_per_day=12,
         min_gap_minutes=10,
         timezone_name="America/New_York",
@@ -163,15 +162,6 @@ class PlatformAssignmentTests(unittest.TestCase):
         self.assertEqual(2, prepare.call_count)
         self.assertTrue(first.slots)
 
-    def test_ranked_youtube_only_now_does_not_signal_fresh_source_or_instagram(self) -> None:
-        runner = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
-        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "youtube"}):
-            with patch.object(runner, "_local_now", return_value=at(0)):
-                with patch.object(runner, "_prepare_youtube_selection", return_value=True):
-                    self.assertEqual("waiting", runner.fire_now())
-        self.assertFalse((self.queue / "scheduler_state.json").exists())
-        self.assertEqual([], runner._plan.slots)
-
     def test_ranked_youtube_slots_and_history_survive_startup(self) -> None:
         first = make_runner(self.queue, youtube_posts_per_day=1, youtube_selection_mode="instagram_top")
         with patch.object(first, "_prepare_youtube_selection", return_value=True):
@@ -260,19 +250,26 @@ class PlatformAssignmentTests(unittest.TestCase):
         self.assertEqual(marker, runner.run_once(late))
         self.assertEqual("scheduled", self.state()["phase"])
 
-    def test_publish_only_restricts_every_slot_to_one_platform(self) -> None:
-        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "youtube"}):
-            runner = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=2)
-            self.assertEqual({"instagram": 0, "youtube": 6}, runner._platform_quotas())
-            self.assertEqual([["youtube"]] * 6, runner._assign_platforms(6))
-            runner._mark_ready(when=at(12))
-            self.assertEqual(["youtube"], self.state()["platforms"])
+    def test_zero_youtube_quota_schedules_only_instagram(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=8, youtube_posts_per_day=0)
+        self.assertEqual({"instagram": 8, "youtube": 0}, runner._platform_quotas())
+        self.assertEqual([["instagram"]] * 8, runner._assign_platforms(8))
+        runner._mark_ready(when=at(12))
+        self.assertEqual(["instagram"], self.state()["platforms"])
 
-    def test_publish_only_overrides_a_saved_plan(self) -> None:
-        make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3).ensure_plan(at(6))
-        with mock.patch.dict(os.environ, {"CLIPPER_PUBLISH_ONLY": "instagram"}):
-            plan = make_runner(self.queue, instagram_posts_per_day=6, youtube_posts_per_day=3).ensure_plan(at(7))
+    def test_zero_instagram_quota_schedules_only_youtube(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=0, youtube_posts_per_day=2)
+        self.assertEqual({"instagram": 0, "youtube": 2}, runner._platform_quotas())
+        self.assertEqual([["youtube"]] * 2, runner._assign_platforms(2))
+
+    def test_zero_youtube_quota_has_no_replay_slots(self) -> None:
+        runner = make_runner(self.queue, instagram_posts_per_day=8, youtube_posts_per_day=0,
+                             youtube_selection_mode="instagram_top")
+        with patch.object(runner, "_prepare_youtube_selection") as prepare:
+            plan = runner.ensure_plan(at(0))
+        self.assertEqual([], plan.youtube_slots)
         self.assertTrue(all(slot == ["instagram"] for slot in plan.platforms))
+        prepare.assert_not_called()
 
     def test_forced_cycle_targets_every_enabled_platform(self) -> None:
         runner = make_runner(self.queue, instagram_posts_per_day=2, youtube_posts_per_day=1)

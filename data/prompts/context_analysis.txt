@@ -1,8 +1,9 @@
 You are given the audio of a short social video (attached, if available) and its original caption. Using ONLY what is spoken in the audio or written in the caption, return:
-1. transcript: the speech transcribed as written text (empty string if there is no speech).
+1. transcript: transcribe only speech actually audible in the attached audio, in chronological order. Return an empty string if there is no audible speech or no audio is attached. Do not infer spoken words from the caption, invent words in silence or music, or continue a repeated phrase beyond what is actually audible. Use [inaudible] for unclear speech instead of guessing. Song lyrics, if intelligible, are not evidence of a concrete event.
 2. context_sufficient: true only if the caption and audio together describe a specific, concrete event (who did or said what). Set false for  song lyrics, vague or unclear content, or anything that would require guessing. When in doubt, return false.
 3. person_hashtags: hashtags for every named person in the caption or audio other than __STREAMER__ (max 2, lowercase letters and digits only, no # symbol). Use only real names or handles that appear in the text, never roles or relationships such as "best friend". Return an empty list only if nobody other than __STREAMER__ is named.
 
 Caption: __CAPTION__
+on-screen caption: __ON_SCREEN_CAPTION__
 
 Return JSON only with schema {"transcript": "string", "context_sufficient": boolean, "person_hashtags": ["string"]}.

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import random
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -16,12 +17,20 @@ import requests
 from clippublisher.config import AppConfig
 from clippublisher.models import QueueItem
 from clippublisher.queue import _read_manifest, _ready_manifest_path, build_queue_item
-from clippublisher.runner import original_title, send_posted_alert
+from clippublisher.runner import original_title, posted_alert_details, send_posted_alert
 from clippublisher.token_manager import read_access_token, resolve_publish_access_token
-from clippublisher.youtube_client import is_configured as youtube_is_configured, publish_to_youtube
+from clippublisher.youtube_client import (
+    YouTubePolicyError,
+    YouTubeScreeningError,
+    is_configured as youtube_is_configured,
+    publish_to_youtube,
+    screen_youtube_content,
+)
 from common.alerts import send_failure_alert
 from common.env import is_test_mode
-from common.platforms import INSTAGRAM, YOUTUBE, publish_only
+from common.creators import active_creator_name, read_creator
+from common.platforms import INSTAGRAM, YOUTUBE
+from common.reporting import publish_usage_details
 
 logger = logging.getLogger(__name__)
 
@@ -218,13 +227,39 @@ class YouTubeReplay:
         manifest = _read_manifest(manifest_path) if manifest_path is not None else {}
         return str(manifest.get("clip_id") or state.get("clip_id") or run_dir.name)
 
-    def _collect(self, yesterday: date, history: list[dict[str, Any]]) -> tuple[list[tuple[Candidate, QueueItem]], list[dict[str, Any]]]:
+    def _alert_policy_rejection(self, item: QueueItem, error: YouTubePolicyError, action: str) -> None:
+        creator = read_creator(item.run_dir).get("display_name", "")
+        active_creator_name.set(creator)
+        summary = " ".join(str(error).split())
+        if len(summary) > 500:
+            summary = summary[:497] + "..."
+        try:
+            send_failure_alert(
+                app_name="ClipPublisher",
+                error=YouTubePolicyError(summary),
+                context="YouTube clip rejected by AI policy screening (not uploaded)",
+                clip_id=item.clip_id,
+                details=f"Creator: {creator or 'unknown (legacy item)'}\nAuthor: @{item.author_handle}\n{action}\n",
+                title=original_title(item.manifest_path, item.caption),
+                subject=f"Rejected - {item.clip_id}",
+                platform="YouTube",
+            )
+        except Exception:
+            logger.exception("YouTube rejection alert could not be sent for %s.", item.clip_id)
+
+    def _collect(
+        self, yesterday: date, history: list[dict[str, Any]], *, notify_rejections: bool = False,
+    ) -> tuple[list[tuple[Candidate, QueueItem]], list[dict[str, Any]]]:
         excluded: list[dict[str, Any]] = []
         on_youtube = {str(entry.get("clip_id")) for entry in history if entry.get("clip_id")}
         found: list[tuple[Candidate, QueueItem | None, dict[str, Any]]] = []
         for run_dir, state in self._publish_states():
             if state.get("phase") != "published" or state.get("status") not in {"success", "partial"}:
                 continue
+            if self.config.creators:
+                creator = read_creator(run_dir).get("name") or self.config.creators[0].name
+                if not any(c.name == creator and c.youtube_posts_per_day > 0 for c in self.config.creators):
+                    continue
             item = build_queue_item(run_dir, use_ai_summary=True)
             clip_id = self._clip_id(run_dir, state, item)
             if youtube_video_id(state.get("result")):
@@ -247,6 +282,21 @@ class YouTubeReplay:
             elif item is None:
                 reason = "missing_local_media"
                 logger.error("YouTube replay: %s (%s) has no local source manifest/editor video; excluded.", candidate.clip_id, candidate.run_dir)
+            else:
+                try:
+                    screen_youtube_content(self.config, item)
+                except YouTubePolicyError as error:
+                    reason = f"youtube_ai_policy: {error}"
+                    logger.warning(
+                        "YouTube replay: %s (%s) excluded by AI policy review; next-ranked clip will be considered. %s",
+                        candidate.clip_id,
+                        candidate.run_dir.name,
+                        error,
+                    )
+                    if notify_rejections:
+                        self._alert_policy_rejection(
+                            item, error, "Excluded from selection; next-highest-view eligible clip will be considered.",
+                        )
             if reason:
                 excluded.append(self._excluded(candidate, reason))
             else:
@@ -338,7 +388,9 @@ class YouTubeReplay:
             logger.error("YouTube replay prepare blocked: %s", error)
             return False
 
-        plan = self._build_plan(local_now, slots, history, lambda: resolve_publish_access_token(self.config))
+        plan = self._build_plan(
+            local_now, slots, history, lambda: resolve_publish_access_token(self.config), notify_rejections=True,
+        )
         if plan is None:
             return False
         self._save_plan(plan)
@@ -352,11 +404,18 @@ class YouTubeReplay:
             _require_aware(slot, "slot")
         return self._build_plan(now.astimezone(self.tz), slots, self._load_history(), lambda: read_access_token(self.config))
 
-    def _build_plan(self, local_now: datetime, slots: list[datetime], history: list[dict[str, Any]], token_fn) -> dict[str, Any] | None:
+    def _build_plan(
+        self, local_now: datetime, slots: list[datetime], history: list[dict[str, Any]], token_fn,
+        *, notify_rejections: bool = False,
+    ) -> dict[str, Any] | None:
         today = local_now.date()
         yesterday = today - timedelta(days=1)
         ordered_slots = sorted(set(slots))[:max(0, self.config.youtube_posts_per_day)]
-        ready, excluded = self._collect(yesterday, history)
+        try:
+            ready, excluded = self._collect(yesterday, history, notify_rejections=notify_rejections)
+        except YouTubeScreeningError as error:
+            logger.error("YouTube replay AI screening unavailable; plan not finalized, will retry. %s", error)
+            return None
         ranked: list[dict[str, Any]] = []
         if ready and ordered_slots:
             try:
@@ -382,20 +441,36 @@ class YouTubeReplay:
                     "views": views,
                     "instagram_published_at": candidate.published_at.isoformat(),
                 }
+                if self.config.creators:
+                    creator = read_creator(candidate.run_dir)
+                    row["creator"] = creator.get("name") or self.config.creators[0].name
+                    row["creator_name"] = creator.get("display_name") or self.config.creators[0].display_name
                 current = best.get(candidate.clip_id)
                 if current is None or self._rank_key(row) < self._rank_key(current):
                     best[candidate.clip_id] = row
             ranked = sorted(best.values(), key=self._rank_key)
 
+        selected = ranked[:len(ordered_slots)]
+        if self.config.creators:
+            selected = []
+            for creator in self.config.creators:
+                selected.extend(
+                    [row for row in ranked if row["creator"] == creator.name][:creator.youtube_posts_per_day]
+                )
+            random.SystemRandom().shuffle(selected)
+            selected = selected[:len(ordered_slots)]
+        selected_ids = {row["clip_id"] for row in selected}
+        reserves = [row for row in ranked if row["clip_id"] not in selected_ids]
+        ranks = {row["clip_id"]: index + 1 for index, row in enumerate(ranked)}
         entries = [
             {
                 **row,
-                "rank": index + 1,
+                "rank": ranks[row["clip_id"]],
                 "slot": slot.astimezone(self.tz).isoformat(),
                 "scheduled_for": slot.astimezone(self.tz).isoformat(),
                 "status": PLANNED,
             }
-            for index, (row, slot) in enumerate(zip(ranked, ordered_slots))
+            for index, (row, slot) in enumerate(zip(selected, ordered_slots))
         ]
         plan = {
             "version": PLAN_VERSION,
@@ -408,7 +483,11 @@ class YouTubeReplay:
             "graph_api_version": self.insights_api_version,
             "slots": [slot.astimezone(self.tz).isoformat() for slot in ordered_slots],
             "entries": entries,
-            "unscheduled": [row["clip_id"] for row in ranked[len(entries):]],
+            "unscheduled": [row["clip_id"] for row in reserves],
+            "reserves": [
+                {**row, "rank": ranks[row["clip_id"]]}
+                for index, row in enumerate(reserves)
+            ],
             "excluded": excluded,
         }
         return plan
@@ -424,7 +503,6 @@ class YouTubeReplay:
             self.config.youtube_selection_mode != "instagram_top"
             or self.config.youtube_posts_per_day <= 0
             or is_test_mode()
-            or publish_only() == INSTAGRAM
         ):
             return False
         local_now = now.astimezone(self.tz)
@@ -478,8 +556,61 @@ class YouTubeReplay:
             logger.error("YouTube replay: %s is already in history; not uploading again.", entry["clip_id"])
             return False
 
-        run_dir = self.config.queue_dir / entry["run_dir"]
-        item = build_queue_item(run_dir, use_ai_summary=True) if run_dir.is_dir() else None
+        approval = None
+        while True:
+            run_dir = self.config.queue_dir / entry["run_dir"]
+            active_creator_name.set(str(entry.get("creator_name") or ""))
+            item = build_queue_item(run_dir, use_ai_summary=True) if run_dir.is_dir() else None
+            valid_media = (
+                item is not None
+                and item.clip_id == entry["clip_id"]
+                and any(
+                    run_dir.resolve().is_relative_to((self.config.queue_dir / folder).resolve())
+                    for folder in SCAN_DIRS
+                )
+            )
+            if not valid_media:
+                break  # Existing upload failure handling records missing or mismatched media.
+            try:
+                approval = screen_youtube_content(self.config, item)
+            except YouTubeScreeningError as error:
+                logger.error("YouTube replay AI screening unavailable; slot remains pending. %s", error)
+                return False
+            except YouTubePolicyError as error:
+                reason = f"youtube_ai_policy: {error}"
+                plan.setdefault("excluded", []).append({
+                    "clip_id": entry["clip_id"],
+                    "media_id": entry.get("media_id"),
+                    "run_dir": entry["run_dir"],
+                    "reason": reason,
+                })
+                logger.warning("YouTube replay excluded %s before upload: %s", entry["clip_id"], error)
+                unavailable = {record.get("clip_id") for record in history}
+                unavailable.update(row["clip_id"] for row in plan["entries"])
+                reserves = plan.get("reserves", [])
+                replacement = None
+                for index, candidate in enumerate(reserves):
+                    if candidate["clip_id"] not in unavailable and candidate.get("creator") == entry.get("creator"):
+                        replacement = reserves.pop(index)
+                        break
+                if replacement is None:
+                    entry["status"] = FAILED
+                    entry["error"] = reason
+                    self._save_plan(plan)
+                    self._alert_policy_rejection(
+                        item, error, "No eligible reserve clips remain; this slot will not be uploaded.",
+                    )
+                    return False
+                entry.update(replacement)
+                plan["unscheduled"] = [row["clip_id"] for row in reserves]
+                self._save_plan(plan)
+                self._alert_policy_rejection(
+                    item, error,
+                    f"Trying next-highest-view reserve: {replacement['clip_id']} ({replacement['views']} Instagram views).",
+                )
+                continue
+            break
+
         record = {
             "date": plan["date"],
             "slot": entry["slot"],
@@ -506,7 +637,7 @@ class YouTubeReplay:
                 raise RuntimeError("Replay media path or clip identity does not match the archived plan.")
             if not youtube_is_configured(self.config):
                 raise RuntimeError("YouTube is not configured (credentials or token file missing)")
-            result = publish_to_youtube(self.config, item)
+            result = publish_to_youtube(self.config, item, approval=approval)
             if not isinstance(result, dict) or not result.get("id"):
                 raise RuntimeError(f"YouTube upload returned no video id: {result}")
         except Exception as error:
@@ -521,7 +652,9 @@ class YouTubeReplay:
                     error=error,
                     context=f"YouTube replay upload failure for {entry['run_dir']} (not retried)",
                     clip_id=entry["clip_id"],
-                    details=f"Instagram views yesterday: {entry.get('views')}\nSlot: {entry['slot']}\n",
+                    details=f"Instagram views yesterday: {entry.get('views')}\nSlot: {entry['slot']}\n"
+                    + f"Creator: {entry.get('creator_name') or 'unknown (legacy item)'}\n"
+                    + publish_usage_details(self.config.queue_dir, replay=True),
                     subject=f"Fail [YT replay #{entry.get('rank')}] - {entry['clip_id']}",
                     platform="YouTube",
                     title=original_title(item.manifest_path, item.caption) if item else "",
@@ -543,9 +676,9 @@ class YouTubeReplay:
                 author_handle=item.author_handle,
                 platform=YOUTUBE,
                 publish_result=result,
-                details=f"Author: @{item.author_handle}\nReplay of yesterday's Instagram rank #{entry.get('rank')} ({entry.get('views')} views)\n",
+                details=posted_alert_details(self.config, item, replay=True)
+                + f"\nReplay of yesterday's Instagram rank #{entry.get('rank')} ({entry.get('views')} views)\n",
                 subject=f"Success [YT replay #{entry.get('rank')}] - {item.clip_id}",
-                title=original_title(item.manifest_path, item.caption),
             )
         except Exception:
             logger.exception("YouTube replay success alert could not be sent for %s.", entry["clip_id"])

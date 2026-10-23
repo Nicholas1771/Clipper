@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,7 +28,10 @@ class ClipEditorConfigTests(unittest.TestCase):
         with patch.dict("os.environ", {"TEST_VAR": "2.5"}):
             self.assertEqual(1.0, _float_env("TEST_VAR", 0.0, 0.0, 1.0))
         with patch.dict("os.environ", {"ALIAS_VAR": "0.15"}):
-            self.assertEqual(0.15, _float_env("PRIMARY_VAR", 0.0, 0.0, 1.0, "ALIAS_VAR"))
+            self.assertEqual(0.0, _float_env("PRIMARY_VAR", 0.0, 0.0, 1.0))
+        with patch.dict("os.environ", {"TEST_VAR": "invalid"}):
+            with self.assertRaises(ValueError):
+                _float_env("TEST_VAR", 0.0, 0.0, 1.0)
 
 
 class ClipEditorRenderTests(unittest.TestCase):
@@ -48,6 +52,35 @@ class ClipEditorRenderTests(unittest.TestCase):
         }
         config_args.update(kwargs)
         return ClipEditorService(AppConfig(**config_args))
+
+    def test_process_records_actual_original_or_numbered_manual_branding(self) -> None:
+        for original, overlay_y, placement in [
+            (True, None, None),
+            (False, "(H-h)*0.8000", 6),
+            (False, "(H-h)*0.7000", None),
+        ]:
+            with self.subTest(original=original, overlay_y=overlay_y), TemporaryDirectory() as tmp:
+                run = Path(tmp) / "clip"
+                (run / "ai").mkdir(parents=True)
+                (run / "ai" / "analysis.json").write_text(json.dumps({
+                    "has_kick_overlay": original,
+                    "kick_overlay_y": 0.8,
+                    "kick_overlay_candidates": [0.2, 0.32, 0.44, 0.56, 0.68, 0.8],
+                }))
+                (run / "queue_state.json").write_text('{"phase": "ai_processed"}')
+                service = self.make_service(queue_dir=Path(tmp))
+                with patch.object(service, "_ready_items", return_value=[run]), \
+                     patch.object(service, "_source_video_path", return_value=run / "source.mp4"), \
+                     patch.object(service, "_read_source_manifest", return_value={}), \
+                     patch.object(service, "_render_edited_video", return_value=overlay_y), \
+                     patch.object(service, "_write_metadata_files"), \
+                     patch.object(service, "_mark_edited"):
+                    self.assertTrue(service.process_once())
+                branding = json.loads((run / "editor" / "branding.json").read_text())
+                self.assertEqual("Original" if original else "Manual", branding["mode"])
+                self.assertEqual(placement, branding.get("placement"))
+                if not original:
+                    self.assertEqual(overlay_y, branding["overlay_y"])
 
     def test_probe_video_info_extracts_size_and_duration(self) -> None:
         service = self.make_service()
@@ -74,7 +107,7 @@ class ClipEditorRenderTests(unittest.TestCase):
             # Title at the top and subtitles across the default spot: the bar sits just above the subtitles.
             bands = [{"top": 0.05, "bottom": 0.14}, {"top": 0.78, "bottom": 0.92}]
             moved = service._kick_overlay_y(Path("video.mp4"), "bottom", bands, **kwargs)
-            self.assertEqual(f"(H-h)*{(0.78 * 1920 - 48 - 108) / 1812:.4f}", moved)
+            self.assertEqual(f"(H-h)*{(0.78 * 1920 - 108) / 1812:.4f}", moved)
             covered = [{"top": 0.0, "bottom": 0.4}, {"top": 0.4, "bottom": 0.8}, {"top": 0.8, "bottom": 1.0}]
             self.assertEqual("(H-h)*0.8000", service._kick_overlay_y(Path("video.mp4"), "bottom", covered, **kwargs))
             # The only text-free spot is above KICK_OVERLAY_TOP_Y, so it is not used.
@@ -92,7 +125,7 @@ class ClipEditorRenderTests(unittest.TestCase):
             both = service._kick_overlay_y(Path("v.mp4"), "bottom", [], caption_position="BOTH", ai_fraction=None, **kwargs)
             self.assertEqual("(H-h)*0.5000", both)
 
-    def test_kick_overlay_never_covers_the_account_watermark(self) -> None:
+    def test_fallback_avoids_watermark_but_ai_selection_is_not_vetoed(self) -> None:
         # Watermark text 38px tall at the middle of the frame (y 941-979), plus a 19px gap.
         service = self.make_service(kick_overlay_top_y=0.2, kick_overlay_bottom_y=0.8, watermark_top_y=0.5, watermark_bottom_y=0.5)
         sizes = {Path("v.mp4"): (1080, 1920), Path("overlay.png"): (1080, 108)}
@@ -105,11 +138,14 @@ class ClipEditorRenderTests(unittest.TestCase):
         with patch.object(service, "_probe_video_size", side_effect=lambda path: sizes[path]):
             for result in (
                 service._kick_overlay_y(Path("v.mp4"), "bottom", [], caption_position="BOTH", **kwargs),
-                service._kick_overlay_y(Path("v.mp4"), "bottom", [], ai_fraction=0.5, **kwargs),
             ):
                 top, bottom = strip_rows(result)
                 self.assertTrue(bottom <= 922 or top >= 998, result)
                 self.assertTrue(0.2 <= float(result.split("*")[1]) <= 0.8)
+            self.assertEqual(
+                "(H-h)*0.5000",
+                service._kick_overlay_y(Path("v.mp4"), "bottom", [{"top": 0, "bottom": 1}], ai_fraction=0.5, **kwargs),
+            )
             # Blurred source watermark at 0.70-0.74 of the frame: our watermark sits there instead.
             box = {"x": 0.3, "y": 0.7, "w": 0.3, "h": 0.04}
             top, bottom = strip_rows(service._kick_overlay_y(Path("v.mp4"), "bottom", [], watermark_box=box, **kwargs))
@@ -123,7 +159,8 @@ class ClipEditorRenderTests(unittest.TestCase):
             with patch.object(service, "_kick_overlay_y", return_value="(H-h)*0.8000"), \
                  patch.object(service, "_probe_video_duration", return_value=None), \
                  patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="", stdout="")) as run:
-                service._render_edited_video(Path("in.mp4"), Path(tmp) / "out.mp4", add_kick_overlay=True)
+                actual = service._render_edited_video(Path("in.mp4"), Path(tmp) / "out.mp4", add_kick_overlay=True)
+                self.assertEqual("(H-h)*0.8000", actual)
             command = run.call_args[0][0]
             graph = command[command.index("-filter_complex") + 1]
             self.assertLess(graph.index("drawtext"), graph.index("[marked][logo]overlay"))

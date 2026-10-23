@@ -39,9 +39,33 @@ Do not copy, print, or commit the private key.
 
 ## Applications and services
 
-Each profile named in `PRODUCTION_PROFILES` runs the five-app pipeline as a `clipper-<profile>.service` systemd unit:
+Each account named in `PRODUCTION_PROFILES` runs one five-app pipeline as a `clipper-<account>.service` systemd unit. `PRODUCTION_PROFILES` retains its existing deployment-variable name, but now lists account config filenames, not creator names:
 
 - Both use `/home/ubuntu/Clipper` and `/home/ubuntu/venv/bin/python`
+
+For the account/creator refactor, provision host-only `accounts\carootclips.env`,
+`accounts\vrlclipmoments.env`, `creators\n3on.env`, `creators\navaeh.env`, and any
+additional configured creator files (currently `creators\blueface.env`) from the
+committed templates using **server-side** values. Merge each old profile and its local
+secrets into the account file; move only sourcing/branding/streamer settings to the creator.
+Keep `ACCOUNT_NAME` and all existing queue, state and token paths unchanged. Set
+`CREATORS=n3on:8:1` for CarootClips or `CREATORS=navaeh:5:1,blueface:3:0` for
+VrlClipMoments, and set creator `REQUIRE_SOURCE_KICK_BRANDING=false` for N3on
+and `true` for Navaeh and Blueface. Deploy each creator's overlay asset as well.
+Set `KICK_PLACEMENT_MODEL=gemini-3.1-pro-preview` for placement calls and
+`KICK_OVERLAY_TOP_Y=0.1`, `KICK_OVERLAY_BOTTOM_Y=0.8` consistently for AI and Editor.
+Remove the old profile/local-env files only after verifying the new host-only files.
+
+Stop the old creator-named units before enabling account-named units; never run old and
+new services against the same queue. Update each systemd `ExecStart` to run
+`/home/ubuntu/venv/bin/python /home/ubuntu/Clipper/run_all_apps.py --carootclips`
+(or `--vrlclipmoments`), update `PRODUCTION_PROFILES`, and run `systemctl daemon-reload`.
+Perform this cutover before the next day's plan: existing YouTube plans retain the old
+profile identity and safely block same-day reuse under a different account selector.
+Do not rewrite plans, token state, or seen history to force a cutover.
+New creator assignments are persisted in the shared account schedule. If multiple
+creators' combined quotas cannot fit the posting window with the current minimum gap,
+explicitly adjust `MIN_GAP_MINUTES` or the window before enabling that configuration.
 
 After deploying shared application code, restart all listed services and verify that each is active:
 
@@ -73,18 +97,18 @@ Do not request tokens in chat or place them in deployment commands/logs.
 In an interactive SSH session, from the remote application directory:
 
 ```bash
-sudo -n systemctl stop clipper-n3on.service
-/home/ubuntu/venv/bin/python apps/ClipPublisher/main.py --refresh-token --n3on --token-prompt
+sudo -n systemctl stop clipper-carootclips.service
+/home/ubuntu/venv/bin/python apps/ClipPublisher/main.py --refresh-token --carootclips --token-prompt
 ```
 
 Enter the new token at the hidden prompt. Only after the command succeeds:
 
 ```bash
-sudo -n systemctl start clipper-n3on.service
-systemctl is-active clipper-n3on.service
+sudo -n systemctl start clipper-carootclips.service
+systemctl is-active clipper-carootclips.service
 ```
 
-Use `--navaeh` and `clipper-navaeh.service` for that account. The same CLI also supports
+Use `--vrlclipmoments` and `clipper-vrlclipmoments.service` for that account. The same CLI also supports
 `--token=TOKEN`, but the hidden prompt avoids credentials in shell history/process arguments.
 For automated rotation from a workstation, pipe the token over SSH standard input with
 `--token-stdin` (never as a command-line argument), with the service stopped as above.
@@ -104,7 +128,15 @@ scp -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes 
 
 Repeat for each changed runtime file, then restart the affected service or both services if the change is shared. Confirm the service state and review logs when needed. Do not use a destructive sync or delete remote-only files.
 
-Never deploy local `.env` files, `profiles\*.local.env`, production state/token files, queue or archive data, or test output over their production counterparts. Shareable `profiles\<name>.env` files contain no credentials; keep production secrets in host-only `profiles\<name>.local.env` files or the service environment.
+Code deployment does not update ignored application configuration. Compare the effective
+non-secret settings for every affected app/profile, and update approved settings on the
+server explicitly rather than copying local `.env` files. In particular, verify
+`MINIMUM_VIEW_COUNT=100000` for ClipSourcer and that ClipPublisher can load the existing
+server-side Gemini credentials and `youtube_policy_screening.txt` prompt.
+Check cached candidates against the effective threshold; clearing candidate caches must
+never clear published seen IDs, attempted-candidate history, or YouTube upload history.
+
+Never deploy local `.env` files, account/creator env files, production state/token files, queue or archive data, or test output over their production counterparts. Both account and creator envs are ignored and host-only; templates contain no credentials. `.local.env` overrides are no longer supported. Preserve host-specific credentials in each account's single env file or service environment.
 
 The root `.env.example` lists the deployment settings. Add their real values to the ignored root `.env`; never place the host address or profile names in tracked files.
 
@@ -114,8 +146,8 @@ A real publish from a workstation records its clip ID only in the local seen his
 production from posting the same clip again, append local seen IDs to production:
 
 ```powershell
-python sync_seen_ids.py --n3on --dry-run   # report how many IDs would be added
-python sync_seen_ids.py --n3on             # append them (use --navaeh for that account)
+python sync_seen_ids.py --carootclips --dry-run   # report how many IDs would be added
+python sync_seen_ids.py --carootclips             # append them (use --vrlclipmoments for that account)
 ```
 
 The IDs travel over SSH standard input to `sync_seen_ids.py --merge-stdin` on the server, which

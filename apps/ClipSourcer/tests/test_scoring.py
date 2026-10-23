@@ -74,16 +74,8 @@ def build_config(root: Path, **overrides: object) -> AppConfig:
         "minimum_view_count": 0,
         "output_dir": root / "queue",
         "state_file": root / "data" / "state.json",
-        "source_history_file": root / "data" / "source_history.json",
-        "source_schedule_file": root / "data" / "source_schedule.json",
         "download_video_files": False,
         "authorized_download_profiles": [],
-        "max_source_runs_per_day": 1,
-        "min_source_gap_minutes": 1200,
-        "source_target_posting_start_hour": 18,
-        "source_lead_minutes": 30,
-        "source_jitter_minutes": 15,
-        "source_grace_minutes": 1440,
         "source_attempts_per_slot": 3,
         "source_timezone_name": "America/New_York",
         "allow_download_bypass": False,
@@ -280,43 +272,14 @@ class ServiceTests(unittest.TestCase):
             captured.output[0],
         )
 
-    def test_scheduled_time_targets_before_posting_window_start(self) -> None:
+    def test_without_scheduler_marker_sourcing_waits(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            config = build_config(
-                root,
-                source_target_posting_start_hour=18,
-                source_lead_minutes=30,
-                source_jitter_minutes=0,
-            )
-
-            service = ClipSourcerService(config)
-            scheduled = service._scheduled_time_for_day(date(2026, 1, 1))
-
-            self.assertEqual(17, scheduled.hour)
-            self.assertEqual(30, scheduled.minute)
-
-    def test_load_or_create_daily_schedule_replaces_stale_time_outside_window(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            config = build_config(
-                root,
-                source_target_posting_start_hour=18,
-                source_lead_minutes=30,
-                source_jitter_minutes=0,
-            )
-            config.source_schedule_file.parent.mkdir(parents=True, exist_ok=True)
-            config.source_schedule_file.write_text(
-                '{"date":"2026-01-01","scheduled_for":"2026-01-01T14:22:00-05:00"}',
-                encoding="utf-8",
-            )
-
-            service = ClipSourcerService(config)
-            now = datetime(2026, 1, 1, 12, 0, tzinfo=ZoneInfo("America/New_York"))
-            scheduled = service._load_or_create_daily_schedule(now)
-
-            self.assertEqual(17, scheduled.hour)
-            self.assertEqual(30, scheduled.minute)
+            service = ClipSourcerService(build_config(root))
+            with patch.object(service, "fetch_items") as fetch:
+                outcome = service.run_once()
+            self.assertEqual(outcome.status, "skipped")
+            fetch.assert_not_called()
 
     def test_run_once_bypasses_schedule_when_forced(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -341,11 +304,9 @@ class ServiceTests(unittest.TestCase):
             ]
 
             service = ClipSourcerService(config, fetch_items=lambda _config: items)
-            with patch.object(service, "_can_source_now", return_value=(False, "not yet")) as mock_can:
-                outcome = service.run_once(bypass_schedule=True)
+            outcome = service.run_once(bypass_schedule=True)
 
             self.assertEqual("sourced", outcome.status)
-            mock_can.assert_not_called()
 
     def test_run_once_marks_scheduler_slot_failed_after_three_attempts(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -426,9 +387,8 @@ class ServiceTests(unittest.TestCase):
                 return items
 
             service = ClipSourcerService(config, fetch_items=fetch_items)
-            with patch.object(service, "_can_source_now", return_value=(True, None)):
-                with self.assertLogs("clipsourcer.service", level="INFO") as fresh_logs:
-                    outcome = service.run_once()
+            with self.assertLogs("clipsourcer.service", level="INFO") as fresh_logs:
+                outcome = service.run_once(bypass_schedule=True)
 
             self.assertTrue(any("Candidate cache size at sourcing start: 0" in line for line in fresh_logs.output))
             self.assertTrue(any("Candidate source: Apify;" in line for line in fresh_logs.output))
@@ -510,8 +470,7 @@ class ServiceTests(unittest.TestCase):
                 mock_tikwm.side_effect = AssertionError("TikWM fallback should not run")
                 mock_apify.side_effect = AssertionError("Apify fallback should not run")
                 service = ClipSourcerService(config, fetch_items=lambda _config: items)
-                with patch.object(service, "_can_source_now", return_value=(True, None)):
-                    outcome = service.run_once()
+                outcome = service.run_once(bypass_schedule=True)
 
             self.assertEqual("sourced", outcome.status)
             assert outcome.result is not None

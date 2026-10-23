@@ -6,6 +6,7 @@ from typing import Any
 import requests
 
 from clipsourcer.config import AppConfig
+from common.reporting import record_apify_usage
 
 
 API_BASE = "https://api.apify.com/v2/acts"
@@ -60,20 +61,24 @@ def fetch_tiktok_items(
         "" if source_count == 1 else "s",
         include_video_downloads,
     )
-    response = requests.post(
-        url,
-        params={"token": config.apify_token},
-        json=build_actor_input(
-            config,
-            include_video_downloads=include_video_downloads,
-            post_urls=post_urls,
-        ),
-        timeout=(30, 240),
-    )
-    response.raise_for_status()
-
-    items = response.json()
-    if not isinstance(items, list):
-        raise ValueError("Apify response did not return a dataset item list.")
+    count = None
+    try:
+        response = requests.post(
+            url,
+            params={"token": config.apify_token},
+            json=build_actor_input(
+                config,
+                include_video_downloads=include_video_downloads,
+                post_urls=post_urls,
+            ),
+            timeout=(30, 240),
+        )
+        response.raise_for_status()
+        items = response.json()
+        if not isinstance(items, list):
+            raise ValueError("Apify response did not return a dataset item list.")
+        count = len(items)
+    finally:
+        record_apify_usage(config.output_dir, count)
     logger.info("Apify returned %s item%s.", len(items), "" if len(items) == 1 else "s")
     return items

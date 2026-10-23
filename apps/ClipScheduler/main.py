@@ -20,7 +20,6 @@ from clipscheduler.runner import STAGES, ClipSchedulerRunner
 from common.alerts import send_failure_alert
 from common.env import is_test_mode
 from common.logging_utils import configure_app_logging
-from common.platforms import YOUTUBE, publish_only
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +43,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_until_stage(runner: ClipSchedulerRunner, stage: str) -> int:
-    if runner.config.youtube_selection_mode == "instagram_top" and publish_only() == YOUTUBE:
-        raise ValueError("--stop-after is for fresh sourcing; omit it for scheduled YouTube replay.")
     runner.force_reset_current_cycle()
     started = runner._local_now()
     runner._mark_ready(when=started)
@@ -56,7 +53,7 @@ def run_until_stage(runner: ClipSchedulerRunner, stage: str) -> int:
             logger.info("Stage '%s' complete. Exiting so the pipeline shuts down.", stage)
             return 0
         if result == "failed":
-            logger.error("Sourcing failed before stage '%s' was reached.", stage)
+            logger.error("Pipeline failed before stage '%s' was reached.", stage)
             return 1
         time.sleep(min(runner.config.poll_interval_seconds, 2))
 
@@ -65,8 +62,8 @@ def main() -> int:
     configure_app_logging("ClipScheduler")
     try:
         args = parse_args()
-        if args.schedule and (is_test_mode() or publish_only()):
-            raise ValueError("--schedule requires normal account configuration, without test mode or a publish-only override.")
+        if args.schedule and is_test_mode():
+            raise ValueError("--schedule requires normal account configuration, without test mode.")
         runner = ClipSchedulerRunner(AppConfig.from_repo_root(APP_ROOT))
         if args.schedule:
             local_now = runner._local_now()
@@ -75,7 +72,7 @@ def main() -> int:
             logger.info("SIMULATION (nothing is saved, sent, sourced or published): start-of-day schedule for %s at %s.", day, start_of_day.isoformat())
             plan, youtube = runner.simulate_day(start_of_day)
             for index, slot in enumerate(plan.slots):
-                logger.info("  Slot %s: %s [%s]", index + 1, slot.strftime("%Y-%m-%d %H:%M:%S %Z"), "+".join(plan.platforms_for(index)) or "none")
+                logger.info("  Slot %s: %s [%s] %s", index + 1, slot.strftime("%Y-%m-%d %H:%M:%S %Z"), "+".join(plan.platforms_for(index)) or "none", plan.creator_names[index] if plan.creator_names else "")
             for slot in plan.youtube_slots:
                 logger.info("  YouTube slot: %s", slot.strftime("%Y-%m-%d %H:%M:%S %Z"))
             if not plan.youtube_slots:

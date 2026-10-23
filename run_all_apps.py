@@ -8,6 +8,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "apps" / "Common" / "src"))
+from common.env import available_accounts
+
 APPS = ("scheduler", "sourcer", "ai", "editor", "publisher")
 APP_DIRS = {
     "scheduler": "ClipScheduler",
@@ -19,9 +22,8 @@ APP_DIRS = {
 
 
 def discover_profiles() -> list[str]:
-    """Every profiles/<name>.env is a runnable profile; adding a file adds a --<name> flag."""
-    profiles_dir = Path(__file__).resolve().parent / "profiles"
-    return sorted(path.stem.lower() for path in profiles_dir.glob("*.env"))
+    """Every accounts/<name>.env is a runnable account."""
+    return available_accounts(Path(__file__).resolve().parent)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     profile_group = parser.add_mutually_exclusive_group()
     profiles = discover_profiles()
     for name in profiles:
-        profile_group.add_argument(f"--{name}", dest="profile", action="store_const", const=name, help=f"Run the {name} profile (profiles\\{name}.env).")
+        profile_group.add_argument(f"--{name}", dest="profile", action="store_const", const=name, help=f"Run the {name} account (accounts\\{name}.env).")
     default_profile = os.getenv("CLIPPER_PROFILE", "").strip().lower()
     if not default_profile:
         default_profile = profiles[0] if profiles else "default"
@@ -42,11 +44,6 @@ def parse_args() -> argparse.Namespace:
         choices=APPS,
         help="Archive existing queue items, run one fresh cycle through this app, then shut everything down.",
     )
-    parser.add_argument(
-        "--publish",
-        choices=("instagram", "youtube"),
-        help="Publish only to this platform (default: whatever the schedule assigns to each slot).",
-    )
     parser.add_argument("--test", action="store_true", help="Run everything inside <QUEUE_DIR>/Test, using its source folder instead of sourcing a new clip.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without launching.")
     parser.add_argument("--schedule", action="store_true", help="Run start-of-day schedule creation (default: tomorrow 00:00) and exit without launching workers.")
@@ -54,8 +51,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.schedule_date and not args.schedule:
         parser.error("--schedule-date requires --schedule")
-    if args.schedule and (args.now or args.stop_after or args.test or args.publish):
-        parser.error("--schedule cannot be combined with --now, --stop-after, --test, or --publish")
+    if args.schedule and (args.now or args.stop_after or args.test):
+        parser.error("--schedule cannot be combined with --now, --stop-after, or --test")
     return args
 
 
@@ -90,16 +87,11 @@ def terminate_children(children: list[subprocess.Popen]) -> None:
             child.kill()
 
 
-def launch_processes(plan: list[tuple[str, Path, list[str]]], stop_mode: bool, test_mode: bool = False, profile: str = "default", publish_only: str | None = None) -> int:
+def launch_processes(plan: list[tuple[str, Path, list[str]]], stop_mode: bool, test_mode: bool = False, profile: str = "default") -> int:
     children: list[subprocess.Popen] = []
     env = dict(os.environ, CLIPPER_PROFILE=profile)
     if test_mode:
         env["CLIPPER_TEST_MODE"] = "1"
-    if publish_only:
-        env["CLIPPER_PUBLISH_ONLY"] = publish_only
-        print(f"[launcher] publishing only to: {publish_only}")
-    else:
-        env.pop("CLIPPER_PUBLISH_ONLY", None)
     print(f"[launcher] profile: {profile}")
     try:
         for name, dir_path, flags in plan:
@@ -136,7 +128,7 @@ def main() -> int:
         for name, dir_path, flags in plan:
             print(f"[dry-run] [{args.profile}] {name} @ {dir_path}: main.py {' '.join(flags)}".rstrip())
         return 0
-    return launch_processes(plan, stop_mode=bool(args.stop_after), test_mode=args.test, profile=args.profile, publish_only=args.publish)
+    return launch_processes(plan, stop_mode=bool(args.stop_after), test_mode=args.test, profile=args.profile)
 
 
 if __name__ == "__main__":

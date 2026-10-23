@@ -21,6 +21,7 @@ from clippublisher.token_manager import resolve_publish_access_token
 from clippublisher.youtube_auth import run_youtube_auth
 from common.alerts import send_failure_alert
 from common.logging_utils import configure_app_logging
+from common.env import available_accounts
 
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh-token", action="store_true", help="Force-refresh and persist the long-lived Instagram token, then exit.")
     parser.add_argument("--youtube-auth", action="store_true", help="Run the one-time YouTube OAuth login for the active profile, then exit.")
     profiles = parser.add_mutually_exclusive_group()
-    for path in sorted((APP_ROOT.parent.parent / "profiles").glob("*.env")):
-        if not path.stem.endswith(".local"):
-            profiles.add_argument(f"--{path.stem}", dest="profile", action="store_const", const=path.stem)
+    for name in available_accounts(APP_ROOT.parent.parent):
+        profiles.add_argument(f"--{name}", dest="profile", action="store_const", const=name)
     tokens = parser.add_mutually_exclusive_group()
     tokens.add_argument("--token", help="Replacement Instagram token; requires --refresh-token. Prefer --token-prompt to avoid shell history.")
     tokens.add_argument("--token-prompt", action="store_true", help="Read a replacement Instagram token using a hidden prompt.")

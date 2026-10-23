@@ -21,26 +21,17 @@ LAYOUT = kick_placement.Layout(1080, 1920, 108.0)
 
 
 class KickPlacementTests(unittest.TestCase):
-    def test_candidates_stay_in_config_range_and_skip_caption_text(self) -> None:
-        all_spots = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8, [])
+    def test_candidates_include_both_complete_grids(self) -> None:
+        all_spots = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8)
         self.assertAlmostEqual(0.2, all_spots[0])
-        self.assertAlmostEqual(0.8, all_spots[-1])
+        self.assertLessEqual(all_spots[-1], 0.8)
         self.assertTrue(all(0.2 <= f <= 0.8 for f in all_spots))
-        steps = [(b - a) * LAYOUT.max_y for a, b in zip(all_spots, all_spots[1:])]
-        self.assertTrue(all(step >= LAYOUT.strip_height for step in steps))
-        clear = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8, [{"top": 0.78, "bottom": 0.92}])
-        self.assertLess(len(clear), len(all_spots))
-        self.assertTrue(all(f * LAYOUT.max_y + 108 <= 0.78 * 1920 - 48 for f in clear))
-
-    def test_watermark_spots_are_always_dropped(self) -> None:
-        keep_out = kick_placement.watermark_span(LAYOUT, box={"x": 0.3, "y": 0.6, "w": 0.3, "h": 0.04}, watermark_y=0.9, size=0.02, opacity=0.3)
-        self.assertAlmostEqual(0.6 * 1920 - 19.2, keep_out[0])
-        spots = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8, [], [keep_out])
-        self.assertTrue(spots)
-        self.assertTrue(all(kick_placement.is_clear(LAYOUT, f, [keep_out]) for f in spots))
-        default = kick_placement.watermark_span(LAYOUT, box=None, watermark_y=0.5, size=0.02, opacity=0.3)
-        self.assertAlmostEqual((1920 - 38) * 0.5 - 19.2, default[0])
-        self.assertIsNone(kick_placement.watermark_span(LAYOUT, box=None, watermark_y=0.5, size=0.02, opacity=0.0))
+        primary, staggered = kick_placement.placement_grids(LAYOUT, 0.2, 0.8)
+        self.assertEqual(primary + staggered, all_spots)
+        for grid in (primary, staggered):
+            steps = [(b - a) * LAYOUT.max_y for a, b in zip(grid, grid[1:])]
+            self.assertTrue(all(abs(step - LAYOUT.strip_height * 1.075) < 0.001 for step in steps))
+        self.assertEqual([(a + b) / 2 for a, b in zip(primary, primary[1:])], staggered)
 
     def test_default_fraction(self) -> None:
         self.assertEqual(0.5, kick_placement.default_fraction(0.2, 0.8, "BOTH"))
@@ -62,16 +53,56 @@ class KickPlacementTests(unittest.TestCase):
         )
         return ClipAIService(config), run_dir
 
-    def test_pick_returns_clear_spot_nearest_the_configured_one(self) -> None:
+    def test_pick_uses_model_ranking_not_configured_preference(self) -> None:
         with TemporaryDirectory() as temp:
             service, run_dir = self._service_and_run(temp)
-            count = len(kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8, []))
-            boxes = [{"number": n, "covers": "x", "clear": n in (2, 3)} for n in range(1, count + 1)]
-            with patch.object(service, "_call_gemini", return_value={"boxes": boxes, "confidence": 0.9}):
-                picked = service._pick_kick_overlay_y(run_dir, {"caption_position": "TOP", "caption_bands": []})
-            fractions = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8, [])
-            self.assertAlmostEqual(round(fractions[2], 4), picked)
+            count = len(kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8))
+            boxes = [{"number": n, "covers": "x", "clear": n in (2, 3), "confidence": 0.9} for n in range(1, count + 1)]
+            visual = {"caption_position": "TOP", "caption_bands": [{"top": 0, "bottom": 1}],
+                      "has_source_watermark": True, "source_watermark_box": {"x": 0, "y": 0, "w": 1, "h": 1}}
+            with patch.object(service, "_call_gemini", return_value={
+                "boxes": boxes, "ranked_clear_boxes": [2, 3], "confidence": 0.9,
+            }) as call:
+                picked = service._pick_kick_overlay_y(run_dir, visual)
+            self.assertEqual("gemini-3.1-pro-preview", call.call_args.kwargs["model"])
+            self.assertEqual(3, call.call_count)
+            self.assertTrue(all(len(c.kwargs["image_paths"]) == 2 for c in call.call_args_list))
+            fractions = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8)
+            self.assertEqual([round(fraction, 4) for fraction in fractions], visual["kick_overlay_candidates"])
+            self.assertAlmostEqual(round(fractions[1], 4), picked)
             self.assertTrue((run_dir / "ai" / "kick_candidates.jpg").exists())
+            with Image.open(run_dir / "ai" / "kick_candidates.jpg") as sheet:
+                self.assertEqual((1644, 1932), sheet.size)
+
+    def test_invalid_ranking_uses_existing_editor_fallback(self) -> None:
+        with TemporaryDirectory() as temp:
+            service, run_dir = self._service_and_run(temp)
+            for ranking in (None, [], [1], [2, 2], [99], [True]):
+                with self.subTest(ranking=ranking), patch.object(service, "_call_gemini", return_value={
+                    "boxes": [{"number": 1, "covers": "face", "clear": False},
+                              {"number": 2, "covers": "jacket", "clear": True}],
+                    "ranked_clear_boxes": ranking, "confidence": 0.95,
+                }):
+                    self.assertIsNone(service._pick_kick_overlay_y(run_dir, {"caption_position": "BOTTOM"}))
+
+    def test_aggregation_requires_all_frames_and_combines_rank_confidence(self) -> None:
+        def response(order, confidence):
+            return {"boxes": [{"number": n, "clear": n in order, "confidence": confidence[n - 1]} for n in (1, 2, 3)],
+                    "ranked_clear_boxes": order}
+        results = [response([1, 2], [.7, .99, .95]),
+                   response([2, 1], [.7, .99, .95]),
+                   response([2, 1, 3], [.7, .99, .95])]
+        ranking = kick_placement.aggregate_rankings(results, 3)
+        self.assertEqual([2, 1], [r["number"] for r in ranking])
+        results[0]["boxes"][1]["confidence"] = .6
+        self.assertEqual([1], [r["number"] for r in kick_placement.aggregate_rankings(results, 3)])
+        results[0]["boxes"].append(results[0]["boxes"][0])
+        with self.assertRaises(ValueError):
+            kick_placement.aggregate_rankings(results, 3)
+        self.assertEqual([], kick_placement.aggregate_rankings(
+            [response([1], [.95, .95, .95]), response([2], [.95, .95, .95]),
+             response([1, 2], [.95, .95, .95])], 3,
+        ))
 
     def test_pick_falls_back_when_nothing_clear_or_unsure(self) -> None:
         with TemporaryDirectory() as temp:

@@ -94,6 +94,11 @@ class TokenReplacementTests(unittest.TestCase):
 
 
 class TokenCommandTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(self.cli, "available_accounts", return_value=["carootclips", "vrlclipmoments"])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @classmethod
     def setUpClass(cls):
         path = Path(__file__).resolve().parents[1] / "main.py"
@@ -102,7 +107,7 @@ class TokenCommandTests(unittest.TestCase):
         spec.loader.exec_module(cls.cli)
 
     def test_profile_flags(self):
-        for profile in ("n3on", "navaeh"):
+        for profile in ("carootclips", "vrlclipmoments"):
             with mock.patch("sys.argv", ["main.py", "--refresh-token", f"--{profile}", "--token=new"]):
                 args = self.cli.parse_args()
             self.assertEqual(args.profile, profile)
@@ -111,14 +116,14 @@ class TokenCommandTests(unittest.TestCase):
     def test_rejects_unsafe_argument_combinations(self):
         for flags in (["--token=new"], ["--token-prompt"], ["--refresh-token", "--once"],
                       ["--refresh-token", "--youtube-auth"], ["--refresh-token", "--token="],
-                      ["--refresh-token", "--n3on", "--navaeh"]):
+                      ["--refresh-token", "--carootclips", "--vrlclipmoments"]):
             with self.subTest(flags=flags), mock.patch("sys.argv", ["main.py", *flags]), \
                  mock.patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
                 self.cli.parse_args()
             self.assertEqual(caught.exception.code, 2)
 
     def test_refresh_sets_profile_and_never_constructs_publisher(self):
-        for profile, flag in (("n3on", "--token=new"), ("navaeh", "--token-prompt")):
+        for profile, flag in (("carootclips", "--token=new"), ("vrlclipmoments", "--token-prompt")):
             with self.subTest(profile=profile), \
                  mock.patch("sys.argv", ["main.py", "--refresh-token", f"--{profile}", flag]), \
                  mock.patch.dict(os.environ, {"CLIPPER_PROFILE": "old"}), \
@@ -134,7 +139,7 @@ class TokenCommandTests(unittest.TestCase):
                 runner.assert_not_called()
 
     def test_token_stdin_reads_one_line_and_rejects_empty(self):
-        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--n3on", "--token-stdin"]), \
+        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--carootclips", "--token-stdin"]), \
              mock.patch.dict(os.environ), \
              mock.patch("sys.stdin", io.StringIO(" piped \n")), \
              mock.patch.object(self.cli, "configure_logging"), \
@@ -142,7 +147,7 @@ class TokenCommandTests(unittest.TestCase):
              mock.patch.object(token_manager, "replace_access_token") as replace:
             self.assertEqual(self.cli.main(), 0)
             replace.assert_called_once_with(config.return_value, "piped")
-        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--n3on", "--token-stdin"]), \
+        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--carootclips", "--token-stdin"]), \
              mock.patch.dict(os.environ), \
              mock.patch("sys.stdin", io.StringIO("")), \
              mock.patch.object(self.cli, "configure_logging"), \
@@ -154,7 +159,7 @@ class TokenCommandTests(unittest.TestCase):
             replace.assert_not_called()
 
     def test_legacy_refresh_still_supported(self):
-        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--n3on"]), \
+        with mock.patch("sys.argv", ["main.py", "--refresh-token", "--carootclips"]), \
              mock.patch.dict(os.environ), \
              mock.patch.object(self.cli, "configure_logging"), \
              mock.patch.object(self.cli.AppConfig, "from_repo_root") as config, \

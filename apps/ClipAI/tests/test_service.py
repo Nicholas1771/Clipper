@@ -21,6 +21,22 @@ from clipai.service import ClipAIService
 
 
 class ClipAITests(unittest.TestCase):
+    def test_source_branding_requires_frames_and_uses_existing_strict_detector(self):
+        service = ClipAIService(AppConfig(
+            queue_dir=Path("."), poll_interval_seconds=1, google_api_key="k",
+            gemini_model="m", timeout_seconds=30, timezone_name="UTC",
+        ))
+        with patch.object(service, "_extract_sample_frames", return_value=[]), \
+             patch.object(service, "_detect_overlay_visual") as detector:
+            with self.assertRaisesRegex(RuntimeError, "No source frames"):
+                service.source_has_kick_branding(Path("clip.mp4"), {})
+            detector.assert_not_called()
+        frames = [Path("frame.jpg")]
+        with patch.object(service, "_extract_sample_frames", return_value=frames), \
+             patch.object(service, "_detect_overlay_visual", return_value={"has_kick_overlay": False}) as detector:
+            self.assertFalse(service.source_has_kick_branding(Path("clip.mp4"), {"text": "caption"}))
+            detector.assert_called_once_with({"text": "caption"}, image_paths=frames)
+
     def test_normalize_hashtags_excludes_streamer_and_caps_at_two(self) -> None:
         service = ClipAIService(AppConfig(
             queue_dir=Path("."), poll_interval_seconds=60, google_api_key="k",
@@ -67,6 +83,10 @@ class ClipAITests(unittest.TestCase):
                 timezone_name="America/New_York",
             )
             service = ClipAIService(config)
+            (run_dir / "creator.json").write_text(json.dumps({
+                "name": "navaeh", "display_name": "Nevaeh",
+                "settings": {"STREAMER_NAME": "Nevaeh", "OVERLAY_IMAGE_PATH": "iamnevaehakira.png"},
+            }))
 
             with patch.object(
                 service,
@@ -90,6 +110,8 @@ class ClipAITests(unittest.TestCase):
                 return_value="First paragraph with context.\n\nSecond paragraph with context.\n\nThird paragraph with context.",
             ):
                 self.assertTrue(service.process_once())
+                self.assertEqual(service.config.streamer_name, "Nevaeh")
+                self.assertEqual(service.config.overlay_reference_image_path.name, "iamnevaehakira.png")
 
             analysis = json.loads((run_dir / "ai" / "analysis.json").read_text(encoding="utf-8"))
             self.assertFalse(analysis["has_kick_overlay"])
@@ -205,6 +227,122 @@ class YouTubeDescriptionTests(unittest.TestCase):
                      patch.object(service, "_write_youtube_files", return_value="d") as write:
                     service.process_once()
                 self.assertEqual(expected, write.called, mode)
+
+
+class OnScreenCaptionTests(unittest.TestCase):
+    def make_service(self, root: Path) -> ClipAIService:
+        return ClipAIService(AppConfig(
+            queue_dir=root, poll_interval_seconds=60, google_api_key="k",
+            prompts_dir=APP_ROOT.parents[1] / "data" / "prompts",
+            gemini_model="m", timeout_seconds=30, timezone_name="America/New_York",
+            streamer_name="N3on", youtube_selection_mode="instagram_top",
+        ))
+
+    def test_existing_caption_call_extracts_text_without_an_extra_call(self):
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(Path(tmp))
+            frames = [Path(tmp) / "reference_frame_1.jpg"]
+            payload = {
+                "has_caption": True, "caption_position": "TOP",
+                "confidence": 0.95, "text_bands": [{"top": 0.1, "bottom": 0.2}],
+                "on_screen_caption": "  N3on meets Kai at the event  ",
+            }
+            with patch.object(service, "_collect_source_frames", return_value=frames), \
+                 patch.object(service, "_call_gemini", return_value=payload) as call:
+                result = service._detect_caption_position({"text": "#n3on"}, run_dir=Path(tmp))
+            self.assertEqual("N3on meets Kai at the event", result["on_screen_caption"])
+            self.assertEqual("TOP", result["caption_position"])
+            call.assert_called_once()
+            self.assertEqual(frames, call.call_args.kwargs["image_paths"])
+            self.assertIn("on_screen_caption", call.call_args.kwargs["response_schema"]["required"])
+            self.assertIn("never guess missing words", call.call_args.args[0])
+
+    def test_absent_unreadable_or_low_confidence_text_is_empty(self):
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(Path(tmp))
+            base = {
+                "has_caption": True, "caption_position": "TOP",
+                "confidence": 0.9, "on_screen_caption": "visible text",
+            }
+            for changes, frames in [
+                ({"has_caption": False}, [Path("frame.jpg")]),
+                ({"confidence": 0.49}, [Path("frame.jpg")]),
+                ({"caption_position": "NONE"}, [Path("frame.jpg")]),
+                ({"on_screen_caption": ""}, [Path("frame.jpg")]),
+                ({"on_screen_caption": None}, [Path("frame.jpg")]),
+                ({}, []),
+            ]:
+                with self.subTest(changes=changes, frames=frames), \
+                     patch.object(service, "_collect_source_frames", return_value=frames), \
+                     patch.object(service, "_call_gemini", return_value={**base, **changes}):
+                    result = service._detect_caption_position({})
+                self.assertEqual("", result["on_screen_caption"])
+
+    def test_hashtag_only_post_uses_visual_text_through_context_and_generators(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self.make_service(root)
+            run = root / "run"
+            (run / "source").mkdir(parents=True)
+            (run / "source" / "m.json").write_text(json.dumps({"text": "#n3on"}), encoding="utf-8")
+            (run / "queue_state.json").write_text(json.dumps({"phase": "sourced"}), encoding="utf-8")
+            text = "N3on meets Kai at the event"
+            with patch.object(service, "_analyze_visual", return_value={
+                "has_caption": True, "caption_position": "TOP", "on_screen_caption": text,
+            }), patch.object(service, "_call_gemini", side_effect=[
+                {"transcript": "hello", "context_sufficient": True, "person_hashtags": ["Kai"]},
+                {"text": "Instagram summary"},
+                {"text": "N3on MEETS Kai"},
+            ]) as call:
+                self.assertTrue(service.process_once())
+            self.assertEqual(3, call.call_count)
+            for args in call.call_args_list:
+                prompt = args.args[0]
+                self.assertIn(text, prompt)
+                self.assertNotIn("__ON_SCREEN_CAPTION__", prompt)
+            self.assertIn("No caption provided.", call.call_args_list[0].args[0])
+            analysis = json.loads((run / "ai" / "analysis.json").read_text(encoding="utf-8"))
+            self.assertEqual(text, analysis["on_screen_caption"])
+            self.assertEqual(["kai"], analysis["hashtags"])
+            self.assertEqual("N3on MEETS Kai", (run / "ai" / "youtube_description.txt").read_text(encoding="utf-8"))
+            self.assertEqual("#n3on", json.loads((run / "source" / "m.json").read_text())["text"])
+
+    def test_all_prompt_builders_keep_original_text_and_fill_optional_context(self):
+        with TemporaryDirectory() as tmp:
+            service = self.make_service(Path(tmp))
+            caption = "Original TikTok caption"
+            text = "Readable on-screen title"
+            prompts = [
+                service._build_context_prompt(caption, text),
+                service._build_summary_prompt(caption, "audio transcript", True, text),
+                service._build_youtube_prompt(caption, "audio transcript", True, text),
+            ]
+            for prompt in prompts:
+                self.assertIn(text, prompt)
+                self.assertNotIn("__ON_SCREEN_CAPTION__", prompt)
+            self.assertIn(caption, prompts[0])
+            self.assertIn(caption, prompts[1])
+            self.assertIn(caption, prompts[2])
+            streamer_prompt = service._build_summary_prompt(caption, "audio transcript", False, text)
+            self.assertNotIn(text, streamer_prompt)
+            self.assertNotIn("__ON_SCREEN_CAPTION__", streamer_prompt)
+            self.assertIn("None detected.", service._build_youtube_prompt(caption, "", False))
+
+    def test_backfill_reuses_saved_visual_caption_without_new_visual_analysis(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self.make_service(root)
+            run = YouTubeDescriptionTests().archived(root, "saved", when="2026-10-14T12:00:00-04:00")
+            (run / "ai" / "analysis.json").write_text(json.dumps({
+                "context_sufficient": True, "on_screen_caption": "Saved on-screen event", "summary": "summary",
+            }))
+            with patch.object(service, "_call_gemini", return_value={"text": "YouTube caption"}) as call, \
+                 patch.object(service, "_analyze_visual") as visual:
+                self.assertEqual(1, service.backfill_youtube_metadata(since=date(2026, 10, 13)))
+            visual.assert_not_called()
+            call.assert_called_once()
+            self.assertIn("Saved on-screen event", call.call_args.args[0])
+            self.assertIn("Clip saved", call.call_args.args[0])
 
 
 if __name__ == "__main__":

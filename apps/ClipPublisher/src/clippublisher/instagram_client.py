@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -10,7 +11,7 @@ from urllib.parse import urljoin
 import requests
 
 from clippublisher.config import AppConfig
-from clippublisher.media_storage import is_r2_enabled, upload_video_and_get_url
+from clippublisher.media_storage import is_r2_enabled, upload_media_and_get_url, upload_video_and_get_url
 from clippublisher.models import QueueItem
 from clippublisher.public_url import ensure_media_base_url
 
@@ -33,6 +34,13 @@ def _split_trailing_hashtags(caption: str) -> tuple[str, list[str]]:
 
 
 def build_caption(config: AppConfig, item: QueueItem) -> str:
+    if config.instagram_caption_file is not None:
+        caption = config.instagram_caption_file.read_text(encoding="utf-8")
+        if not caption.strip():
+            raise ValueError("INSTAGRAM_CAPTION_FILE must not be empty.")
+        if len(caption) > 2200:
+            raise ValueError("INSTAGRAM_CAPTION_FILE exceeds Instagram's 2200-character limit.")
+        return caption
     preferred = (item.description or item.caption).strip()
     caption = preferred.replace("\r\n", "\n").replace("\r", "\n")
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
@@ -63,6 +71,32 @@ def build_public_video_url(config: AppConfig, item: QueueItem) -> str:
         relative_path = item.video_path.relative_to(config.queue_dir).as_posix()
     except ValueError:
         relative_path = item.video_path.relative_to(item.run_dir.parent).as_posix()
+    base_url = ensure_media_base_url(config.media_base_url)
+    return urljoin(f"{base_url.rstrip('/')}/", relative_path)
+
+
+def build_public_cover_url(config: AppConfig, item: QueueItem) -> str:
+    from PIL import Image
+
+    if config.instagram_cover_image is None:
+        raise ValueError("INSTAGRAM_COVER_IMAGE is required to build a reel cover.")
+    cover = item.run_dir / "publisher" / "instagram_cover.jpg"
+    with Image.open(config.instagram_cover_image) as image:
+        if image.format != "JPEG":
+            raise ValueError("INSTAGRAM_COVER_IMAGE must be a JPEG image.")
+        image.verify()
+    if config.instagram_cover_image.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError("Instagram reel cover exceeds the 8 MB limit.")
+    cover.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(config.instagram_cover_image, cover)
+    if is_r2_enabled(config):
+        return upload_media_and_get_url(config, item, cover, content_type="image/jpeg")
+    if not config.media_base_url:
+        raise ValueError("MEDIA_BASE_URL is required to serve the Instagram reel cover.")
+    try:
+        relative_path = cover.relative_to(config.queue_dir).as_posix()
+    except ValueError:
+        relative_path = cover.relative_to(item.run_dir.parent).as_posix()
     base_url = ensure_media_base_url(config.media_base_url)
     return urljoin(f"{base_url.rstrip('/')}/", relative_path)
 
@@ -104,6 +138,8 @@ def publish_to_instagram(config: AppConfig, item: QueueItem, *, access_token: st
         "caption": caption,
         "media_type": "REELS",
     }
+    if config.instagram_cover_image is not None:
+        media_payload["cover_url"] = build_public_cover_url(config, item)
 
     response = requests.post(
         f"https://graph.facebook.com/v20.0/{ig_user_id}/media",

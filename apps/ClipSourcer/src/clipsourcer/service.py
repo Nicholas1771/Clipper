@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 from pathlib import Path
-import random
 import shutil
 import time
+import tempfile
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -19,6 +19,10 @@ from clipsourcer.downloads import download_video_file
 from clipsourcer.models import ClipCandidate
 from clipsourcer.scoring import has_minimum_views, is_recent, matches_keyword, rank_candidates, viral_score
 from clipsourcer.storage import load_seen_ids, run_timestamp, unique_run_dir, read_queue_state, write_manifest, write_queue_state
+from common.reporting import record_post, sourcing_run
+from common.platforms import read_slot_platforms
+from common.creators import config_for_creator, creator_payload
+from clipsourcer.branding import has_source_kick_branding
 
 
 logger = logging.getLogger(__name__)
@@ -142,11 +146,16 @@ class ClipSourcerService:
         fetch_items: Callable[[AppConfig], list[dict]] = fetch_tiktok_items,
         *,
         test_mode: bool = False,
+        branding_check: Callable[[Path, dict], bool] = has_source_kick_branding,
     ) -> None:
         self.config = config
+        self._base_config = config
+        self._creator: dict[str, Any] = {}
+        self.branding_check = branding_check
         self.test_mode = test_mode
         self.fetch_items = fetch_items
         self._tz = ZoneInfo(config.source_timezone_name)
+        self._run_reporting: dict[str, Any] = {}
 
     def _local_now(self) -> datetime:
         return datetime.now(self._tz)
@@ -181,16 +190,47 @@ class ClipSourcerService:
             if self.config.source_mode == "hashtag"
             else sorted(self.config.source_profiles)
         )
+        scope_fields: dict[str, str | list[str] | int] = {
+            "actor": self.config.apify_actor_id,
+            "mode": self.config.source_mode,
+            "target": source_target,
+        }
+        if self.config.require_source_kick_branding:
+            scope_fields["branding_gate_version"] = 1
         scope = json.dumps(
-            {
-                "actor": self.config.apify_actor_id,
-                "mode": self.config.source_mode,
-                "target": source_target,
-            },
+            scope_fields,
             sort_keys=True,
             separators=(",", ":"),
         )
         return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+    def _screen_branding(
+        self, ranked: list[tuple[ClipCandidate, float]], attempted_ids: set[str]
+    ) -> list[tuple[ClipCandidate, float]]:
+        if not self.config.require_source_kick_branding:
+            return ranked
+        accepted: list[tuple[ClipCandidate, float]] = []
+        with tempfile.TemporaryDirectory(prefix="clipper-source-screen-") as directory:
+            screening_config = replace(self.config, output_dir=Path(directory))
+            for candidate, score in ranked:
+                try:
+                    video = download_video_file(screening_config, candidate)
+                except (OSError, RuntimeError) as error:
+                    logger.warning("Skipping clip %s before cache admission because its screening download failed: %s", candidate.clip_id, error)
+                    continue
+                if video is None:
+                    logger.warning("Skipping clip %s before cache admission: no authorized source video for branding verification.", candidate.clip_id)
+                    continue
+                try:
+                    branded = self.branding_check(video, candidate.raw_payload)
+                finally:
+                    video.unlink(missing_ok=True)
+                if branded:
+                    accepted.append((candidate, score))
+                else:
+                    logger.info("Skipping clip %s before cache admission: required source Kick branding is absent.", candidate.clip_id)
+                    self._reserve_candidate(candidate.clip_id, attempted_ids)
+        return accepted
 
     def _load_candidate_cache(self, seen_ids: set[str], now: datetime) -> list[ClipCandidate]:
         cache_path = self.config.candidate_cache_file
@@ -263,117 +303,6 @@ class ClipSourcerService:
                     candidate.url,
                 )
 
-    def _scheduler_ready(self) -> bool:
-        state_path = self.config.output_dir / "scheduler_state.json"
-        if not state_path.exists():
-            return False
-        payload = load_json(state_path)
-        return isinstance(payload, dict) and payload.get("phase") == "scheduled"
-
-    def _source_history(self) -> list[datetime]:
-        payload = load_json(self.config.source_history_file)
-        if not isinstance(payload, list):
-            return []
-
-        parsed: list[datetime] = []
-        for raw in payload:
-            if not isinstance(raw, str):
-                continue
-            try:
-                parsed.append(datetime.fromisoformat(raw).astimezone(timezone.utc))
-            except ValueError:
-                continue
-        return sorted(parsed)
-
-    def _schedule_window_for_day(self, day: date) -> tuple[datetime, datetime, datetime]:
-        day_start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=self._tz)
-        posting_start_minutes = self.config.source_target_posting_start_hour * 60
-        if posting_start_minutes <= 0:
-            raise ValueError("SOURCE_TARGET_POSTING_START_HOUR must be between 1 and 23.")
-
-        base_minutes = posting_start_minutes - self.config.source_lead_minutes
-        min_minutes = max(0, base_minutes - self.config.source_jitter_minutes)
-        max_minutes = min(posting_start_minutes - 1, base_minutes + self.config.source_jitter_minutes)
-        if max_minutes < min_minutes:
-            max_minutes = max(0, posting_start_minutes - 1)
-            min_minutes = max_minutes
-
-        peak_minutes = max(min_minutes, min(max_minutes, base_minutes))
-        return (
-            day_start + timedelta(minutes=min_minutes),
-            day_start + timedelta(minutes=max_minutes),
-            day_start + timedelta(minutes=peak_minutes),
-        )
-
-    def _scheduled_time_for_day(self, day: date) -> datetime:
-        window_start, window_end, window_peak = self._schedule_window_for_day(day)
-        total_minutes = int((window_end - window_start).total_seconds() // 60)
-        peak_offset = int((window_peak - window_start).total_seconds() // 60)
-        offset_minutes = int(round(random.triangular(0, total_minutes, peak_offset)))
-        return window_start + timedelta(minutes=offset_minutes)
-
-    def _load_or_create_daily_schedule(self, now: datetime) -> datetime:
-        today_key = now.date().isoformat()
-        payload = load_json(self.config.source_schedule_file)
-        if isinstance(payload, dict):
-            scheduled_for_raw = payload.get("scheduled_for")
-            if payload.get("date") == today_key and isinstance(scheduled_for_raw, str):
-                try:
-                    scheduled_for = datetime.fromisoformat(scheduled_for_raw).astimezone(self._tz)
-                    window_start, window_end, _window_peak = self._schedule_window_for_day(now.date())
-                    if window_start <= scheduled_for <= window_end:
-                        return scheduled_for
-                    logger.info(
-                        "Replacing stale sourcing schedule %s because it no longer fits today's pre-post window (%s to %s).",
-                        scheduled_for.isoformat(),
-                        window_start.isoformat(),
-                        window_end.isoformat(),
-                    )
-                except ValueError:
-                    pass
-
-        scheduled_for = self._scheduled_time_for_day(now.date())
-        save_json(
-            self.config.source_schedule_file,
-            {
-                "date": today_key,
-                "scheduled_for": scheduled_for.isoformat(),
-            },
-        )
-        logger.info("Scheduled today's sourcing run for %s.", scheduled_for.isoformat())
-        return scheduled_for
-
-    def _can_source_now(self, now: datetime) -> tuple[bool, str | None]:
-        history_utc = self._source_history()
-        history_local = [timestamp.astimezone(self._tz) for timestamp in history_utc]
-
-        if history_local:
-            last_source_local = history_local[-1]
-            min_gap = timedelta(minutes=self.config.min_source_gap_minutes)
-            if now - last_source_local < min_gap:
-                next_allowed = last_source_local + min_gap
-                return False, f"last sourcing run was too recent; wait until {next_allowed.isoformat()}"
-
-        today_runs = [timestamp for timestamp in history_local if timestamp.date() == now.date()]
-        if len(today_runs) >= self.config.max_source_runs_per_day:
-            return False, "daily sourcing cap reached"
-
-        scheduled_for = self._load_or_create_daily_schedule(now)
-        if now < scheduled_for:
-            return False, f"waiting for today's randomized sourcing time at {scheduled_for.isoformat()}"
-
-        grace_deadline = scheduled_for + timedelta(minutes=self.config.source_grace_minutes)
-        if now > grace_deadline:
-            return False, f"today's sourcing window expired at {grace_deadline.isoformat()}"
-
-        return True, None
-
-    def _record_source_run(self, now: datetime) -> None:
-        history = self._source_history()
-        history.append(now.astimezone(timezone.utc))
-        history = sorted(history)
-        save_json(self.config.source_history_file, [item.isoformat() for item in history])
-
     def _update_scheduler_state(self, scheduler_state_path: Path, scheduler_state: dict[str, Any], **updates: Any) -> None:
         updated_scheduler_state = dict(scheduler_state)
         updated_scheduler_state.update(updates)
@@ -412,6 +341,9 @@ class ClipSourcerService:
             shutil.copy2(path, source_dir / path.name)
         manifest = next((source_dir / path.name for path in files if path.suffix.lower() == ".json"), None)
         video = next((source_dir / path.name for path in files if path.suffix.lower() == ".mp4"), None)
+        save_json(run_dir / "reporting.json", self._run_reporting)
+        if self._creator:
+            save_json(run_dir / "creator.json", self._creator)
         write_queue_state(
             run_dir,
             phase="sourced",
@@ -439,7 +371,8 @@ class ClipSourcerService:
         if self.test_mode:
             return self._source_from_test_folder(scheduler_state_path, scheduler_state)
         logger.info(
-            "Starting sourcing cycle (mode=%s, lookback_hours=%s, results_per_page=%s, min_views=%s).",
+            "Starting sourcing cycle (creator=%s, mode=%s, lookback_hours=%s, results_per_page=%s, min_views=%s).",
+            self._creator.get("display_name") or "standalone",
             self.config.source_mode,
             self.config.lookback_hours,
             self.config.results_per_page,
@@ -509,6 +442,8 @@ class ClipSourcerService:
             len(ranked),
             len(unseen_ranked),
         )
+        if origin == "Apify":
+            unseen_ranked = self._screen_branding(unseen_ranked, attempted_ids)
         if not unseen_ranked:
             logger.info("No eligible new clip found in this attempt because all matching clips are already seen or filtered out.")
             self._save_candidate_cache([])
@@ -561,7 +496,6 @@ class ClipSourcerService:
                 score,
                 downloaded_video_path=downloaded_video_path,
             )
-            self._record_source_run(datetime.now(timezone.utc))
             run_dir = manifest_path.parent
             source_dir = run_dir / "source"
             source_dir.mkdir(parents=True, exist_ok=True)
@@ -573,6 +507,9 @@ class ClipSourcerService:
                 target_video = source_dir / downloaded_video_path.name
                 downloaded_video_path.replace(target_video)
                 downloaded_video_path = target_video
+            save_json(run_dir / "reporting.json", self._run_reporting)
+            if self._creator:
+                save_json(run_dir / "creator.json", self._creator)
             write_queue_state(
                 run_dir,
                 phase="sourced",
@@ -608,7 +545,46 @@ class ClipSourcerService:
         )
 
     def run_once(self, *, bypass_schedule: bool = False) -> SourcingCycleOutcome:
-        now_local = self._local_now()
+        self.config = self._base_config
+        state = load_json(self.config.output_dir / "scheduler_state.json")
+        if self.config.creators:
+            name = state.get("creator") if isinstance(state, dict) else None
+            if not name and len(self.config.creators) > 1:
+                raise ValueError("Multi-creator sourcing requires a scheduler slot with an assigned creator.")
+            creator = next((creator for creator in self.config.creators if creator.name == name), None)
+            if creator is None:
+                if name:
+                    raise ValueError(f"Scheduler assigned an unconfigured creator: {name}")
+                creator = self.config.creators[0]
+            self._creator = creator_payload(creator)
+            self.config = config_for_creator(self.config, self._creator)
+            cache = str(self.config.candidate_cache_file).replace("{CREATOR_NAME}", creator.name)
+            if "{CREATOR_NAME}" not in str(self._base_config.candidate_cache_file) and creator.name != self.config.creators[0].name:
+                path = Path(cache)
+                cache = str(path.with_name(f"{path.stem}_{creator.name}{path.suffix}"))
+            self.config = replace(self.config, candidate_cache_file=Path(cache))
+        with sourcing_run() as run_id:
+            state = load_json(self.config.output_dir / "scheduler_state.json")
+            scheduled_for = state.get("scheduled_for", "") if isinstance(state, dict) else ""
+            if bypass_schedule or not scheduled_for:
+                scheduled_for = self._local_now().isoformat()
+            platforms = read_slot_platforms(self.config.output_dir)
+            self._run_reporting = {
+                "run_id": run_id,
+                "scheduled_for": scheduled_for,
+                "platforms": platforms,
+                "cache_file": str(self.config.candidate_cache_file.resolve()),
+                "creator": self._creator.get("display_name", ""),
+            }
+            outcome = self._run_once(bypass_schedule=bypass_schedule)
+            if outcome.status in {"source_failed", "no_match", "error"}:
+                record_post(
+                    self.config.output_dir, scheduled_for, platforms, "failed", outcome.reason or "Sourcing failed",
+                    creator=self._creator.get("display_name", ""),
+                )
+            return outcome
+
+    def _run_once(self, *, bypass_schedule: bool = False) -> SourcingCycleOutcome:
         scheduler_state_path = self.config.output_dir / "scheduler_state.json"
         scheduler_state = {}
         if scheduler_state_path.exists():
@@ -619,11 +595,9 @@ class ClipSourcerService:
             if scheduler_ready:
                 logger.info("ClipScheduler has marked the queue ready; proceeding with this sourcing cycle.")
             else:
-                allowed, reason = self._can_source_now(now_local)
-                if not allowed:
-                    logger.info("Skipping sourcing cycle because the daily schedule has not opened: %s", reason)
-                    return SourcingCycleOutcome(status="skipped", reason=reason)
-                logger.info("No scheduler signal was present; falling back to the legacy local schedule gate for this source cycle.")
+                reason = "waiting for ClipScheduler to assign a slot; use --once for an explicit unscheduled run"
+                logger.info("Skipping sourcing cycle: %s.", reason)
+                return SourcingCycleOutcome(status="skipped", reason=reason)
         else:
             logger.info("Running one-off sourcing cycle immediately; ignoring the scheduler gate.")
         attempts = self.config.source_attempts_per_slot if scheduler_ready and not bypass_schedule else 1

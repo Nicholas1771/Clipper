@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 INSTAGRAM = "instagram"
 YOUTUBE = "youtube"
 PLATFORMS = (INSTAGRAM, YOUTUBE)
 PLATFORM_LABELS = {INSTAGRAM: "Instagram", YOUTUBE: "YouTube"}
-PUBLISH_ONLY_ENV = "CLIPPER_PUBLISH_ONLY"
-
-
-def publish_only() -> str | None:
-    """The single platform to publish to when the pipeline was launched with --publish, else None."""
-    value = os.getenv(PUBLISH_ONLY_ENV, "").strip().lower()
-    return value if value in PLATFORMS else None
 
 
 def normalize_platforms(value: object) -> list[str]:
@@ -32,5 +24,4 @@ def read_slot_platforms(queue_dir: Path) -> list[str]:
     except (OSError, ValueError):
         state = None
     platforms = normalize_platforms(state.get("platforms") if isinstance(state, dict) else None)
-    only = publish_only()
-    return [only] if only else platforms
+    return platforms

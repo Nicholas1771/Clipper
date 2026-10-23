@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 
 from common.env import load_app_env, looks_like_windows_path, parse_bool
+from common.creators import Creator, configured_creators
 from clippublisher.public_url import resolve_media_base_url
 
 @dataclass(frozen=True)
@@ -28,16 +29,6 @@ class AppConfig:
     r2_key_prefix: str
     caption_prefix: str
     streamer_hashtag: str
-    max_retries: int
-    retry_delay_seconds: int
-    max_posts_per_day: int
-    max_posts_per_week: int
-    min_post_interval_minutes: int
-    posting_start_hour: int
-    posting_end_hour: int
-    posting_peak_hour: int
-    posting_peak_minute: int
-    posting_grace_minutes: int
     timezone_name: str
     youtube_client_id: str = ""
     youtube_client_secret: str = ""
@@ -50,6 +41,13 @@ class AppConfig:
     youtube_start_hour: int = 10
     youtube_end_hour: int = 12
     replay_profile: str = "default"
+    google_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash-lite"
+    timeout_seconds: int = 180
+    prompts_dir: Path | None = None
+    creators: tuple[Creator, ...] = ()
+    instagram_caption_file: Path | None = None
+    instagram_cover_image: Path | None = None
 
     @classmethod
     def from_repo_root(cls, repo_root: Path, *, resolve_media_url: bool = True) -> "AppConfig":
@@ -82,7 +80,29 @@ class AppConfig:
         if not youtube_token_file.is_absolute():
             youtube_token_file = root_dir / youtube_token_file
 
+        prompts_dir = Path(os.getenv("AI_PROMPTS_DIR", "data/prompts")).expanduser()
+        if not prompts_dir.is_absolute():
+            prompts_dir = root_dir / prompts_dir
+
+        def optional_file(setting: str) -> Path | None:
+            raw = os.getenv(setting, "").strip()
+            if not raw:
+                return None
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = root_dir / path
+            if not path.is_file():
+                raise ValueError(f"{setting} must point to an existing file: {path}")
+            return path
+
         return cls(
+            instagram_caption_file=optional_file("INSTAGRAM_CAPTION_FILE"),
+            instagram_cover_image=optional_file("INSTAGRAM_COVER_IMAGE"),
+            creators=configured_creators(root_dir),
+            prompts_dir=prompts_dir,
+            google_api_key=os.getenv("GOOGLE_API_KEY", "").strip(),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite",
+            timeout_seconds=int(os.getenv("TIMEOUT_SECONDS", "180")),
             youtube_selection_mode=os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip().lower() or "shared",
             youtube_posts_per_day=int(os.getenv("YOUTUBE_POSTS_PER_DAY", "").strip() or "0"),
             youtube_start_hour=int(os.getenv("YOUTUBE_SCHEDULE_START_HOUR", "10")),
@@ -113,15 +133,5 @@ class AppConfig:
             r2_key_prefix=os.getenv("R2_KEY_PREFIX", "processing").strip().strip("/"),
             caption_prefix=os.getenv("CAPTION_PREFIX", "").strip(),
             streamer_hashtag=os.getenv("STREAMER_HASHTAG", "").strip().lstrip("#"),
-            max_retries=int(os.getenv("MAX_RETRIES", "3")),
-            retry_delay_seconds=int(os.getenv("RETRY_DELAY_SECONDS", "30")),
-            max_posts_per_day=int(os.getenv("MAX_POSTS_PER_DAY", "1")),
-            max_posts_per_week=int(os.getenv("MAX_POSTS_PER_WEEK", "7")),
-            min_post_interval_minutes=int(os.getenv("MIN_POST_INTERVAL_MINUTES", "1200")),
-            posting_start_hour=int(os.getenv("POSTING_START_HOUR", "18")),
-            posting_end_hour=int(os.getenv("POSTING_END_HOUR", "21")),
-            posting_peak_hour=int(os.getenv("POSTING_PEAK_HOUR", "19")),
-            posting_peak_minute=int(os.getenv("POSTING_PEAK_MINUTE", "15")),
-            posting_grace_minutes=int(os.getenv("POSTING_GRACE_MINUTES", "60")),
             timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
         )

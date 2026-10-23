@@ -28,8 +28,9 @@ class ScheduleCommandTests(unittest.TestCase):
         cls.scheduler = load_module("schedule_entrypoint", APP_ROOT / "main.py")
 
     def test_launcher_starts_only_scheduler_for_each_profile(self):
-        for profile in ("n3on", "navaeh"):
+        for profile in ("carootclips", "vrlclipmoments"):
             with self.subTest(profile=profile), \
+                 mock.patch.object(self.launcher, "discover_profiles", return_value=["carootclips", "vrlclipmoments"]), \
                  mock.patch("sys.argv", ["run_all_apps.py", f"--{profile}", "--schedule"]), \
                  mock.patch.object(self.launcher, "launch_processes", return_value=0) as launch:
                 self.assertEqual(self.launcher.main(), 0)
@@ -40,7 +41,7 @@ class ScheduleCommandTests(unittest.TestCase):
                 self.assertFalse(launch.call_args.kwargs["test_mode"])
 
     def test_launcher_rejects_pipeline_flags(self):
-        for flags in (["--now"], ["--stop-after=editor"], ["--test"], ["--publish=youtube"]):
+        for flags in (["--now"], ["--stop-after=editor"], ["--test"]):
             with self.subTest(flags=flags), mock.patch("sys.argv", ["run_all_apps.py", "--schedule", *flags]), \
                  mock.patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
                 self.launcher.parse_args()
@@ -50,7 +51,6 @@ class ScheduleCommandTests(unittest.TestCase):
         with mock.patch("sys.argv", ["main.py", "--schedule", "--schedule-date=2026-10-15"]), \
              mock.patch.object(self.scheduler, "configure_app_logging"), \
              mock.patch.object(self.scheduler, "is_test_mode", return_value=False), \
-             mock.patch.object(self.scheduler, "publish_only", return_value=None), \
              mock.patch.object(self.scheduler.AppConfig, "from_repo_root"), \
              mock.patch.object(self.scheduler, "ClipSchedulerRunner") as runner:
             tz = ZoneInfo("America/New_York")
@@ -67,7 +67,6 @@ class ScheduleCommandTests(unittest.TestCase):
         with mock.patch("sys.argv", ["main.py", "--schedule"]), \
              mock.patch.object(self.scheduler, "configure_app_logging"), \
              mock.patch.object(self.scheduler, "is_test_mode", return_value=False), \
-             mock.patch.object(self.scheduler, "publish_only", return_value=None), \
              mock.patch.object(self.scheduler.AppConfig, "from_repo_root"), \
              mock.patch.object(self.scheduler, "ClipSchedulerRunner") as runner:
             tz = ZoneInfo("America/New_York")
@@ -91,7 +90,6 @@ class ScheduleCommandTests(unittest.TestCase):
         with mock.patch("sys.argv", ["main.py", "--schedule"]), \
              mock.patch.object(self.scheduler, "configure_app_logging"), \
              mock.patch.object(self.scheduler, "is_test_mode", return_value=False), \
-             mock.patch.object(self.scheduler, "publish_only", return_value=None), \
              mock.patch.object(self.scheduler.AppConfig, "from_repo_root"), \
              mock.patch.object(self.scheduler, "ClipSchedulerRunner") as runner, \
              mock.patch.object(self.scheduler, "send_failure_alert") as alert, \
@@ -121,7 +119,7 @@ class SimulateDayTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             queue = Path(tmp)
             config = AppConfig(queue_dir=queue, poll_interval_seconds=60, schedule_start_hour=10, schedule_end_hour=22,
-                               schedule_peak_hour=17, instagram_posts_per_day=6, min_gap_minutes=10,
+                               instagram_posts_per_day=6, min_gap_minutes=10,
                                timezone_name="America/New_York", youtube_selection_mode="instagram_top",
                                youtube_posts_per_day=1)
             runner = ClipSchedulerRunner(config, rng=random.Random(1))

@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
-from common.env import load_app_env, looks_like_windows_path, parse_bool, parse_csv
+from common.env import load_app_env, looks_like_windows_path, parse_bool
+from common.creators import Creator, configured_creators
 
 
 @dataclass(frozen=True)
@@ -22,75 +23,48 @@ class AppConfig:
     minimum_view_count: int
     output_dir: Path
     state_file: Path
-    source_history_file: Path
-    source_schedule_file: Path
     download_video_files: bool
     authorized_download_profiles: list[str]
-    max_source_runs_per_day: int
-    min_source_gap_minutes: int
-    source_target_posting_start_hour: int
-    source_lead_minutes: int
-    source_jitter_minutes: int
-    source_grace_minutes: int
     source_attempts_per_slot: int
     source_timezone_name: str
     allow_download_bypass: bool = False
+    require_source_kick_branding: bool = False
+    creators: tuple[Creator, ...] = ()
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
         root_dir = load_app_env(repo_root)
 
-        source_mode = os.getenv("SOURCE_MODE", "hashtag").strip().lower()
-        if source_mode not in {"hashtag", "profiles"}:
-            raise ValueError("SOURCE_MODE must be 'hashtag' or 'profiles'.")
-
-        source_profiles = parse_csv(os.getenv("SOURCE_PROFILES", ""))
-        if source_mode == "profiles" and not source_profiles:
-            raise ValueError("SOURCE_PROFILES must contain at least one profile in profiles mode.")
-
         apify_token = os.getenv("APIFY_TOKEN", "").strip()
         if not apify_token:
             raise ValueError("APIFY_TOKEN is required.")
 
-        output_default = os.getenv("QUEUE_DIR", "data/queue").strip()
-        output_raw = os.getenv("OUTPUT_DIR", "").strip() or output_default
+        output_raw = os.getenv("QUEUE_DIR", "data/queue").strip()
         if os.name != "nt" and looks_like_windows_path(output_raw):
-            output_raw = output_default
+            raise ValueError("QUEUE_DIR must be a Linux-compatible path on this host.")
         output_dir = Path(output_raw).expanduser()
         if not output_dir.is_absolute():
             output_dir = root_dir / output_dir
         state_raw = os.getenv("STATE_FILE", "data/state.json").strip()
-        history_raw = os.getenv("SOURCE_HISTORY_FILE", "data/source_history.json").strip()
-        schedule_raw = os.getenv("SOURCE_SCHEDULE_FILE", "data/source_schedule.json").strip()
         cache_raw = os.getenv("CANDIDATE_CACHE_FILE", "").strip() or "data/candidate_cache.json"
         if os.name != "nt" and looks_like_windows_path(state_raw):
             state_raw = "data/state.json"
-        if os.name != "nt" and looks_like_windows_path(history_raw):
-            history_raw = "data/source_history.json"
-        if os.name != "nt" and looks_like_windows_path(schedule_raw):
-            schedule_raw = "data/source_schedule.json"
         if os.name != "nt" and looks_like_windows_path(cache_raw):
             cache_raw = "data/candidate_cache.json"
         state_file = Path(state_raw).expanduser()
-        source_history_file = Path(history_raw).expanduser()
-        source_schedule_file = Path(schedule_raw).expanduser()
         candidate_cache_file = Path(cache_raw).expanduser()
         if not state_file.is_absolute():
             state_file = root_dir / state_file
-        if not source_history_file.is_absolute():
-            source_history_file = root_dir / source_history_file
-        if not source_schedule_file.is_absolute():
-            source_schedule_file = root_dir / source_schedule_file
         if not candidate_cache_file.is_absolute():
             candidate_cache_file = root_dir / candidate_cache_file
 
         return cls(
             apify_token=apify_token,
             apify_actor_id=os.getenv("APIFY_ACTOR_ID", "clockworks~tiktok-scraper").strip(),
-            source_mode=source_mode,
-            source_hashtag=os.getenv("SOURCE_HASHTAG", "").strip().lstrip("#"),
-            source_profiles=source_profiles,
-            keyword_filter=os.getenv("KEYWORD_FILTER", "").strip(),
+            source_mode="hashtag",
+            source_hashtag="",
+            source_profiles=[],
+            keyword_filter="",
             candidate_cache_file=candidate_cache_file,
             poll_interval_minutes=float(os.getenv("POLL_INTERVAL_MINUTES", "60")),
             lookback_hours=int(os.getenv("LOOKBACK_HOURS", "4")),
@@ -98,20 +72,11 @@ class AppConfig:
             minimum_view_count=int(os.getenv("MINIMUM_VIEW_COUNT", "0")),
             output_dir=output_dir,
             state_file=state_file,
-            source_history_file=source_history_file,
-            source_schedule_file=source_schedule_file,
-            download_video_files=parse_bool(os.getenv("DOWNLOAD_VIDEO_FILES", "false")),
-            authorized_download_profiles=parse_csv(os.getenv("AUTHORIZED_DOWNLOAD_PROFILES", "")),
-            max_source_runs_per_day=int(os.getenv("MAX_SOURCE_RUNS_PER_DAY", "1")),
-            min_source_gap_minutes=int(os.getenv("MIN_SOURCE_GAP_MINUTES", "1200")),
-            source_target_posting_start_hour=int(os.getenv("SOURCE_TARGET_POSTING_START_HOUR", "18")),
-            source_lead_minutes=int(os.getenv("SOURCE_LEAD_MINUTES", "30")),
-            source_jitter_minutes=int(os.getenv("SOURCE_JITTER_MINUTES", "15")),
-            source_grace_minutes=int(os.getenv("SOURCE_GRACE_MINUTES", "90")),
+            download_video_files=False,
+            authorized_download_profiles=[],
             source_attempts_per_slot=int(os.getenv("SOURCE_ATTEMPTS_PER_SLOT", "3")),
-            source_timezone_name=(
-                os.getenv("SOURCE_TIMEZONE_NAME", "").strip()
-                or os.getenv("TIMEZONE_NAME", "America/New_York").strip()
-            ),
+            source_timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
             allow_download_bypass=parse_bool(os.getenv("ALLOW_DOWNLOAD_BYPASS", "false")),
+            require_source_kick_branding=False,
+            creators=configured_creators(root_dir),
         )

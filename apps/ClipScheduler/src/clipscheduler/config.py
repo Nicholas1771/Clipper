@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import os
 
 from common.env import load_app_env, looks_like_windows_path
+from common.creators import Creator, configured_creators
 
 
 @dataclass(frozen=True)
@@ -13,7 +15,6 @@ class AppConfig:
     poll_interval_seconds: int
     schedule_start_hour: int
     schedule_end_hour: int
-    schedule_peak_hour: int
     instagram_posts_per_day: int
     min_gap_minutes: int
     timezone_name: str
@@ -21,14 +22,16 @@ class AppConfig:
     youtube_selection_mode: str = "shared"
     youtube_start_hour: int = 10
     youtube_end_hour: int = 12
-    youtube_peak_hour: int = 11
+    daily_report_time: str = "23:00"
+    creators: tuple[Creator, ...] = ()
 
-    @property
-    def slots_per_day(self) -> int:
-        """One slot per clip: as many as the busiest platform needs."""
-        if self.youtube_selection_mode == "instagram_top":
-            return max(0, self.instagram_posts_per_day)
-        return max(0, self.instagram_posts_per_day, self.youtube_posts_per_day)
+    def __post_init__(self) -> None:
+        try:
+            parsed = datetime.strptime(self.daily_report_time, "%H:%M")
+            if parsed.strftime("%H:%M") != self.daily_report_time:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError("DAILY_REPORT_TIME must be HH:MM in 24-hour time (00:00-23:59).") from error
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":
@@ -47,13 +50,13 @@ class AppConfig:
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "30")),
             schedule_start_hour=int(os.getenv("SCHEDULE_START_HOUR", "17")),
             schedule_end_hour=int(os.getenv("SCHEDULE_END_HOUR", "19")),
-            schedule_peak_hour=int(os.getenv("SCHEDULE_PEAK_HOUR", "18")),
-            instagram_posts_per_day=int(os.getenv("INSTAGRAM_POSTS_PER_DAY", "").strip() or os.getenv("POSTS_PER_DAY", "5")),
+            instagram_posts_per_day=int(os.getenv("INSTAGRAM_POSTS_PER_DAY", "0")),
             min_gap_minutes=int(os.getenv("MIN_GAP_MINUTES", "75")),
             timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
             youtube_posts_per_day=int(os.getenv("YOUTUBE_POSTS_PER_DAY", "").strip() or "0"),
             youtube_selection_mode=youtube_mode,
             youtube_start_hour=int(os.getenv("YOUTUBE_SCHEDULE_START_HOUR", "10")),
             youtube_end_hour=int(os.getenv("YOUTUBE_SCHEDULE_END_HOUR", "12")),
-            youtube_peak_hour=int(os.getenv("YOUTUBE_SCHEDULE_PEAK_HOUR", "11")),
+            daily_report_time=os.getenv("DAILY_REPORT_TIME", "23:00").strip(),
+            creators=configured_creators(root_dir),
         )

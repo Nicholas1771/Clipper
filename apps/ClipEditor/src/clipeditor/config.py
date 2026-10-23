@@ -23,8 +23,8 @@ class AppConfig:
     source_sharpness: float = 0.0
     watermark_top_y: float = 0.5
     watermark_bottom_y: float = 0.5
-    kick_overlay_top_y: float = 0.26
-    kick_overlay_bottom_y: float = 0.74
+    kick_overlay_top_y: float = 0.1
+    kick_overlay_bottom_y: float = 0.8
     watermark_opacity: float = 0.42
     watermark_size: float = 0.02
     trim_start_seconds: float = 0.0
@@ -69,14 +69,14 @@ class AppConfig:
             timezone_name=os.getenv("TIMEZONE_NAME", "America/New_York").strip(),
             source_contrast=_float_env("SOURCE_CONTRAST", 1.0, 0.0, 3.0),
             source_sharpness=_float_env("SOURCE_SHARPNESS", 0.0, 0.0, 5.0),
-            watermark_top_y=_float_env("WATERMARK_TOP_Y", _float_env("WATERMARK_Y", 0.5, 0.0, 1.0), 0.0, 1.0),
-            watermark_bottom_y=_float_env("WATERMARK_BOTTOM_Y", _float_env("WATERMARK_Y", 0.5, 0.0, 1.0), 0.0, 1.0),
-            kick_overlay_top_y=_float_env("KICK_OVERLAY_TOP_Y", 0.26, 0.0, 1.0),
-            kick_overlay_bottom_y=_float_env("KICK_OVERLAY_BOTTOM_Y", 0.74, 0.0, 1.0),
+            watermark_top_y=_float_env("WATERMARK_TOP_Y", 0.5, 0.0, 1.0),
+            watermark_bottom_y=_float_env("WATERMARK_BOTTOM_Y", 0.5, 0.0, 1.0),
+            kick_overlay_top_y=_float_env("KICK_OVERLAY_TOP_Y", 0.1, 0.0, 1.0),
+            kick_overlay_bottom_y=_float_env("KICK_OVERLAY_BOTTOM_Y", 0.8, 0.0, 1.0),
             watermark_opacity=_float_env("WATERMARK_OPACITY", 0.42, 0.0, 1.0),
             watermark_size=_float_env("WATERMARK_SIZE", 0.02, 0.0, 1.0),
-            trim_start_seconds=_float_env("TRIM_START_SECONDS", 0.0, 0.0, 3600.0, "CLIP_TRIM_START_SECONDS"),
-            trim_end_seconds=_float_env("TRIM_END_SECONDS", 0.0, 0.0, 3600.0, "CLIP_TRIM_END_SECONDS"),
+            trim_start_seconds=_float_env("TRIM_START_SECONDS", 0.0, 0.0, 3600.0),
+            trim_end_seconds=_float_env("TRIM_END_SECONDS", 0.0, 0.0, 3600.0),
             audio_pitch_scale=_float_env("AUDIO_PITCH_SCALE", 1.0, 0.5, 2.0),
         )
 
@@ -111,13 +111,9 @@ def _default_font_name() -> str:
     return "DejaVu Sans"
 
 
-def _float_env(name: str, default: float, low: float, high: float, *aliases: str) -> float:
-    for candidate in (name, *aliases):
-        raw = os.getenv(candidate, "").strip()
-        if raw:
-            try:
-                value = float(raw)
-                return max(low, min(high, value))
-            except ValueError:
-                pass
-    return default
+def _float_env(name: str, default: float, low: float, high: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    value = float(raw)
+    return max(low, min(high, value))

@@ -28,6 +28,16 @@ TZ = ZoneInfo("America/New_York")
 
 
 class ScheduleAlertFormattingTests(unittest.TestCase):
+    def test_creator_names_appear_in_schedule_and_started_emails(self):
+        slot = ScheduleSlot(
+            time=datetime(2026, 10, 19, 18, tzinfo=TZ), account="ExampleAccount",
+            platforms="Instagram", creator="Nevaeh",
+        )
+        schedule = build_schedule_alert_body([slot], slot.time.date(), "America/New_York", 8, 23)
+        started = build_started_alert_body({}, [slot], slot.time.date(), "America/New_York", 8, 23)
+        for body in (schedule, started):
+            self.assertIn("ExampleAccount | Nevaeh | Instagram", body)
+
     def test_schedule_includes_selected_youtube_replay_not_empty_opportunities(self):
         with TemporaryDirectory() as tmp:
             queue = Path(tmp)
@@ -278,6 +288,47 @@ class ScheduleAlertFormattingTests(unittest.TestCase):
             self.assertTrue(first)
             self.assertFalse(second)
             self.assertEqual(1, sent_count)
+
+    def _slot(self, hour):
+        return [ScheduleSlot(time=datetime(2026, 10, 12, hour, tzinfo=TZ), account="A", platforms="Instagram")]
+
+    def test_failed_alert_send_is_retried(self):
+        for alert in (send_consolidated_started_alert, send_consolidated_schedule_alert):
+            with self.subTest(alert=alert.__name__), TemporaryDirectory() as tmp:
+                sender = mock.Mock(side_effect=[False, True, True])
+                now = datetime(2026, 10, 12, 8, 0, tzinfo=TZ)
+                with mock.patch("common.schedule_alerts.sys", mock.Mock(modules={})):
+                    self.assertFalse(alert(Path(tmp), now, send_alert_fn=sender))
+                    self.assertTrue(alert(Path(tmp), now, send_alert_fn=sender))
+                    self.assertFalse(alert(Path(tmp), now, send_alert_fn=sender))
+                self.assertEqual(2, sender.call_count)
+
+    def test_changed_schedule_sends_again_same_day(self):
+        for alert in (send_consolidated_started_alert, send_consolidated_schedule_alert):
+            with self.subTest(alert=alert.__name__), TemporaryDirectory() as tmp:
+                sender = mock.Mock(return_value=True)
+                now = datetime(2026, 10, 12, 8, 0, tzinfo=TZ)
+                slots = [(self._slot(10), [], None), (self._slot(10), [], None), (self._slot(12), [], None)]
+                with mock.patch("common.schedule_alerts.sys", mock.Mock(modules={})), \
+                     mock.patch("common.schedule_alerts.collect_schedule_slots", side_effect=slots):
+                    self.assertTrue(alert(Path(tmp), now, send_alert_fn=sender))
+                    self.assertFalse(alert(Path(tmp), now, send_alert_fn=sender))
+                    self.assertTrue(alert(Path(tmp), now, send_alert_fn=sender))
+                self.assertEqual(2, sender.call_count)
+
+    def test_startup_alert_sends_again_after_cooldown(self):
+        with TemporaryDirectory() as tmp:
+            sender = mock.Mock(return_value=True)
+            now = datetime(2026, 10, 12, 8, 0, tzinfo=TZ)
+            with mock.patch("common.schedule_alerts.sys", mock.Mock(modules={})), \
+                 mock.patch("common.schedule_alerts.time.time", side_effect=lambda: clock[0]):
+                clock = [1000.0]
+                self.assertTrue(send_consolidated_started_alert(Path(tmp), now, send_alert_fn=sender))
+                clock[0] += 60
+                self.assertFalse(send_consolidated_started_alert(Path(tmp), now, send_alert_fn=sender))
+                clock[0] += 200
+                self.assertTrue(send_consolidated_started_alert(Path(tmp), now, send_alert_fn=sender))
+            self.assertEqual(2, sender.call_count)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ from clipai.config import AppConfig
 from clipai.service import ClipAIService
 from common.alerts import send_failure_alert
 from common.logging_utils import configure_app_logging
+from common.reporting import record_stage_failure
+from common.env import available_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +38,19 @@ def parse_args() -> argparse.Namespace:
         type=date.fromisoformat,
         help="Write missing YouTube title/description for archived Instagram posts published on/after SINCE (YYYY-MM-DD), then exit.",
     )
-    for path in sorted((APP_ROOT.parent.parent / "profiles").glob("*.env")):
-        if not path.stem.endswith(".local"):
-            parser.add_argument(f"--{path.stem}", dest="profile", action="store_const", const=path.stem)
+    accounts = parser.add_mutually_exclusive_group()
+    for name in available_accounts(APP_ROOT.parent.parent):
+        accounts.add_argument(f"--{name}", dest="profile", action="store_const", const=name)
     return parser.parse_args()
 
 
 def main() -> int:
     configure_logging()
+    config = None
+    backfill = False
     try:
         args = parse_args()
+        backfill = bool(args.backfill_youtube)
         if getattr(args, "profile", None):
             os.environ["CLIPPER_PROFILE"] = args.profile
         config = AppConfig.from_repo_root(APP_ROOT)
@@ -66,6 +71,8 @@ def main() -> int:
         return 0
     except Exception as error:
         logger.exception("ClipAI failed: %s", error)
+        if config is not None and not backfill:
+            record_stage_failure(config.queue_dir, "ClipAI", error)
         send_failure_alert(app_name="ClipAI", error=error, context="runtime failure")
         return 1
 
