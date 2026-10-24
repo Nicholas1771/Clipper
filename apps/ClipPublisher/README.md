@@ -18,12 +18,10 @@ successfully published. Old queue items without usage or source metadata show un
 values rather than guesses.
 
 Editor branding is `Original` when the original Kick branding was retained, or
-`Manual [6]` (for example) when the editor applied numbered position 6 from the
-clip's `ai/kick_candidates.jpg`. The AI records candidate positions in
-`ai/analysis.json`; the editor saves the actual rendered position and matching
-number in `editor/branding.json`. Candidate counts depend on the available space,
-overlay size, captions and watermark; numbering is not forced to six if the actual
-candidate set differs. An unnumbered editor fallback is explicitly reported as
+`Manual [protected regions, y=0.4310]` (for example) when the editor applied the
+fraction selected from Flash-detected protected regions. The editor saves the
+actual position, method and fraction in `editor/branding.json`. Historical
+numbered placement records still display their saved number. An editor fallback is explicitly reported as
 `Manual [unavailable: unnumbered fallback]`; older items without branding records
 show unknown rather than inventing a placement.
 

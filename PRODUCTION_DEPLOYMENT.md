@@ -52,7 +52,7 @@ Keep `ACCOUNT_NAME` and all existing queue, state and token paths unchanged. Set
 `CREATORS=n3on:8:1` for CarootClips or `CREATORS=navaeh:5:1,blueface:3:0` for
 VrlClipMoments, and set creator `REQUIRE_SOURCE_KICK_BRANDING=false` for N3on
 and `true` for Navaeh and Blueface. Deploy each creator's overlay asset as well.
-Set `KICK_PLACEMENT_MODEL=gemini-3.1-pro-preview` for placement calls and
+Set `KICK_PLACEMENT_MODEL=gemini-2.5-flash` for the single-call protected-region placement and
 `KICK_OVERLAY_TOP_Y=0.1`, `KICK_OVERLAY_BOTTOM_Y=0.8` consistently for AI and Editor.
 Remove the old profile/local-env files only after verifying the new host-only files.
 
@@ -131,7 +131,7 @@ Repeat for each changed runtime file, then restart the affected service or both 
 Code deployment does not update ignored application configuration. Compare the effective
 non-secret settings for every affected app/profile, and update approved settings on the
 server explicitly rather than copying local `.env` files. In particular, verify
-`MINIMUM_VIEW_COUNT=100000` for ClipSourcer and that ClipPublisher can load the existing
+the intended `MINIMUM_VIEW_COUNT` for ClipSourcer and that ClipPublisher can load the existing
 server-side Gemini credentials and `youtube_policy_screening.txt` prompt.
 Check cached candidates against the effective threshold; clearing candidate caches must
 never clear published seen IDs, attempted-candidate history, or YouTube upload history.

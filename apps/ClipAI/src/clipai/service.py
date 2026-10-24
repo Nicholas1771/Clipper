@@ -605,104 +605,89 @@ class ClipAIService:
         return combined
 
     def _pick_kick_overlay_y(self, run_dir: Path | None, visual: dict[str, Any]) -> float | None:
-        """Gemini ranks clear numbered strip positions inside the configured range.
-
-        Returns the highest-ranked clear position as a fraction (y = (H - h) * fraction), or None
-        when nothing is confirmed clear, so the editor falls back to its own placement.
-        """
+        """One Flash call locates protected content; code chooses a gap common to every frame."""
         from PIL import Image
 
         overlay_path = self.config.overlay_reference_image_path
         frames = [run_dir / "ai" / f"reference_frame_{index}.jpg" for index in (1, 2, 3)] if run_dir else []
         frames = [frame for frame in frames if frame.exists()]
         if overlay_path is None or not frames:
+            logger.warning("Kick placement requires an overlay asset and sampled frames; using editor fallback.")
             return None
-        with Image.open(overlay_path) as overlay, Image.open(frames[0]) as frame:
+        with Image.open(overlay_path) as overlay:
             strip_height = round(kick_placement.OUTPUT_WIDTH * overlay.height / overlay.width)
-            layout = kick_placement.Layout(frame.width, frame.height, strip_height)
-        top_y, bottom_y = self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y
-        caption_position = str(visual.get("caption_position") or "NONE")
-        fractions = kick_placement.candidate_fractions(layout, top_y, bottom_y)
-        visual["kick_overlay_candidates"] = [round(fraction, 4) for fraction in fractions]
-        if not fractions:
-            logger.warning("No Kick overlay positions fit the output geometry for %s.", run_dir.name)
-            return None
-        _, staggered = kick_placement.placement_grids(layout, top_y, bottom_y)
-        kick_placement.draw_candidates(
-            frames, layout, fractions, run_dir / "ai" / "kick_candidates.jpg", staggered=staggered,
-        )
+        layouts = []
+        for path in frames:
+            with Image.open(path) as frame:
+                layouts.append(kick_placement.Layout(frame.width, frame.height, strip_height))
+        region_frames = [
+            kick_placement.draw_region_ruler(path, run_dir / "ai" / f"kick_regions_{number}.jpg")
+            for number, path in enumerate(frames, 1)
+        ]
         prompt = self._fill_prompt(
             self._read_prompt_template("kick_placement.txt"),
-            {"FRAME_COUNT": str(len(frames)), "CANDIDATE_COUNT": str(len(fractions))},
-        )
-        watermark_y = self.config.watermark_top_y if caption_position == "BOTTOM" else self.config.watermark_bottom_y
-        prompt += (
-            f"\nAccount watermark on 1080x1920 output: opacity={self.config.watermark_opacity}, "
-            f"font_height={round(self.config.watermark_size * 1920)}px, top Y=(1920-font_height)*{watermark_y}. "
-            f"If present, this normalized source box instead anchors its center after fitting: "
-            f"{visual.get('source_watermark_box') if visual.get('has_source_watermark') else None}.\n"
+            {"FRAME_COUNT": {1: "one", 2: "two", 3: "three"}[len(frames)],
+             "FRAME_NUMBERS": ",".join(str(number) for number in range(1, len(frames) + 1))},
         )
         schema = {
             "type": "OBJECT",
             "properties": {
-                "boxes": {
+                "regions": {
                     "type": "ARRAY",
                     "items": {
                         "type": "OBJECT",
                         "properties": {
-                            "number": {"type": "INTEGER"},
-                            "covers": {"type": "STRING"},
-                            "clear": {"type": "BOOLEAN"},
-                            "confidence": {"type": "NUMBER"},
+                            "frame": {"type": "INTEGER"},
+                            "kind": {"type": "STRING"},
+                            "top": {"type": "INTEGER"},
+                            "bottom": {"type": "INTEGER"},
                         },
-                        "required": ["number", "covers", "clear", "confidence"],
-                        "propertyOrdering": ["number", "covers", "clear", "confidence"],
+                        "required": ["frame", "kind", "top", "bottom"],
                     },
                 },
-                "ranked_clear_boxes": {"type": "ARRAY", "items": {"type": "INTEGER"}},
             },
-            "required": ["boxes", "ranked_clear_boxes"],
-            "propertyOrdering": ["boxes", "ranked_clear_boxes"],
+            "required": ["regions"],
         }
-        results = []
-        for index, frame in enumerate(frames, 1):
-            frame_sheet = kick_placement.draw_candidates(
-                [frame], layout, fractions, run_dir / "ai" / f"kick_frame_{index}.jpg", staggered=staggered,
-            )
-            with Image.open(frame_sheet) as image:
-                for row, name in enumerate(("primary", "staggered")):
-                    image.crop((0, row * 972, 540, row * 972 + 960)).save(
-                        run_dir / "ai" / f"kick_frame_{index}_{name}.jpg", quality=95,
-                    )
-            results.append(self._call_gemini(
-                prompt, response_schema=schema,
-                image_paths=[run_dir / "ai" / f"kick_frame_{index}_{name}.jpg" for name in ("primary", "staggered")],
-                model=self.config.kick_placement_model, temperature=0.0,
-                stage="kick_placement",
-            ))
-        evidence = {"frames": results, "fractions": fractions}
+        result = self._call_gemini(
+            prompt, response_schema=schema, image_paths=region_frames,
+            model=self.config.kick_placement_model, temperature=0.0,
+            thinking_budget=2048, max_output_tokens=4096, stage="kick_placement",
+        )
+        evidence = {
+            "method": "protected_regions", "model": self.config.kick_placement_model,
+            "response": result, "frame_files": [path.name for path in frames],
+            "input_files": [path.name for path in region_frames],
+            "strip_height": strip_height, "status": "pending",
+        }
         evidence_path = run_dir / "ai" / "kick_placement_results.json"
-        evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        _write_json(evidence_path, evidence)
         try:
-            ranking = kick_placement.aggregate_rankings(results, len(fractions))
-        except ValueError:
-            logger.exception("Invalid per-frame Kick placement assessments for %s; using fallback.", run_dir.name)
+            intervals = kick_placement.protected_intervals(result, layouts)
+            placement = kick_placement.choose_position(
+                intervals, strip_height, self.config.kick_overlay_top_y, self.config.kick_overlay_bottom_y,
+            )
+        except ValueError as error:
+            evidence.update(status="invalid", error=str(error))
+            _write_json(evidence_path, evidence)
+            logger.exception("Invalid Kick protected regions for %s; using editor fallback.", run_dir.name)
             return None
-        evidence["combined_ranking"] = ranking
-        evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-        if not ranking:
-            logger.warning("No Kick position passed every sampled frame for %s; using fallback.", run_dir.name)
+        evidence.update(
+            status="selected" if placement else "no_fit",
+            protected_intervals=intervals,
+            fraction=placement.fraction if placement else None,
+            margin=placement.margin if placement else None,
+            clearance=placement.clearance if placement else None,
+        )
+        _write_json(evidence_path, evidence)
+        if placement is None:
+            logger.warning("No Kick strip fits the protected regions for %s; using editor fallback.", run_dir.name)
             return None
-        chosen = round(fractions[ranking[0]["number"] - 1], 4)
-        logger.info("Kick overlay for %s placed at %.4f with combined score %.3f.", run_dir.name, chosen, ranking[0]["score"])
-        return chosen
-
-    @staticmethod
-    def _fraction_label(fractions: list[float], number: Any) -> str:
-        try:
-            return f"{fractions[int(number) - 1]:.3f}"
-        except (TypeError, ValueError, IndexError):
-            return "?"
+        if placement.margin == 0:
+            logger.warning("Kick placement for %s requires a tight fit without the extra 12px margin.", run_dir.name)
+        visual["kick_placement_method"] = "protected_regions"
+        logger.info("Kick overlay for %s placed at %.4f (margin=%dpx, clearance=%.1fpx).",
+                    run_dir.name, placement.fraction, placement.margin, placement.clearance)
+        return placement.fraction
 
     def _extract_audio(self, video_path: Path, output_path: Path) -> Path | None:
         """Mono 16 kHz wav (about 2 MB/min); Gemini transcribes it at roughly 32 tokens per second of audio."""
@@ -930,7 +915,7 @@ class ClipAIService:
                 "caption_bands": caption_bands,
                 "on_screen_caption": on_screen_caption,
                 "kick_overlay_y": visual.get("kick_overlay_y") if not has_kick_overlay else None,
-                "kick_overlay_candidates": visual.get("kick_overlay_candidates", []),
+                "kick_placement_method": visual.get("kick_placement_method"),
                 "has_source_watermark": has_source_watermark,
                 "source_watermark_box": source_watermark_box,
                 "context_sufficient": context_sufficient,

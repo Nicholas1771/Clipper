@@ -53,11 +53,11 @@ class ClipEditorRenderTests(unittest.TestCase):
         config_args.update(kwargs)
         return ClipEditorService(AppConfig(**config_args))
 
-    def test_process_records_actual_original_or_numbered_manual_branding(self) -> None:
-        for original, overlay_y, placement in [
+    def test_process_records_actual_original_or_region_manual_branding(self) -> None:
+        for original, overlay_y, method in [
             (True, None, None),
-            (False, "(H-h)*0.8000", 6),
-            (False, "(H-h)*0.7000", None),
+            (False, "(H-h)*0.8000", "protected_regions"),
+            (False, "(H-h)*0.7000", "fallback"),
         ]:
             with self.subTest(original=original, overlay_y=overlay_y), TemporaryDirectory() as tmp:
                 run = Path(tmp) / "clip"
@@ -65,7 +65,7 @@ class ClipEditorRenderTests(unittest.TestCase):
                 (run / "ai" / "analysis.json").write_text(json.dumps({
                     "has_kick_overlay": original,
                     "kick_overlay_y": 0.8,
-                    "kick_overlay_candidates": [0.2, 0.32, 0.44, 0.56, 0.68, 0.8],
+                    "kick_placement_method": "protected_regions",
                 }))
                 (run / "queue_state.json").write_text('{"phase": "ai_processed"}')
                 service = self.make_service(queue_dir=Path(tmp))
@@ -78,9 +78,10 @@ class ClipEditorRenderTests(unittest.TestCase):
                     self.assertTrue(service.process_once())
                 branding = json.loads((run / "editor" / "branding.json").read_text())
                 self.assertEqual("Original" if original else "Manual", branding["mode"])
-                self.assertEqual(placement, branding.get("placement"))
+                self.assertEqual(method, branding.get("method"))
                 if not original:
                     self.assertEqual(overlay_y, branding["overlay_y"])
+                    self.assertEqual(0.8 if method == "protected_regions" else None, branding.get("fraction"))
 
     def test_probe_video_info_extracts_size_and_duration(self) -> None:
         service = self.make_service()

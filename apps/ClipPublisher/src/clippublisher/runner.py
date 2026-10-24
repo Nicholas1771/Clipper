@@ -124,11 +124,14 @@ def posted_alert_details(config: AppConfig, item: QueueItem, *, replay: bool = F
         branding_text = "Original"
     elif isinstance(branding, dict) and branding.get("mode") == "Manual":
         placement = branding.get("placement")
-        branding_text = (
-            f"Manual [{placement}]"
-            if isinstance(placement, int) and not isinstance(placement, bool) and placement > 0
-            else "Manual [unavailable: unnumbered fallback]"
-        )
+        fraction = branding.get("fraction")
+        if (branding.get("method") == "protected_regions"
+                and isinstance(fraction, (int, float)) and not isinstance(fraction, bool) and 0 <= fraction <= 1):
+            branding_text = f"Manual [protected regions, y={fraction:.4f}]"
+        elif isinstance(placement, int) and not isinstance(placement, bool) and placement > 0:
+            branding_text = f"Manual [{placement}]"
+        else:
+            branding_text = "Manual [unavailable: unnumbered fallback]"
     else:
         logger.warning("Editor branding metadata is unavailable for success alert %s.", item.clip_id)
     author = str(manifest.get("author_handle") or item.author_handle).lstrip("@")

@@ -520,17 +520,15 @@ class ClipEditorService:
             branding: dict[str, Any] = {"mode": "Original" if not add_kick_overlay else "Manual"}
             if add_kick_overlay:
                 branding["overlay_y"] = overlay_y
-                candidates = ai_state.get("kick_overlay_candidates") or []
-                branding["placement"] = next(
-                    (
-                        index for index, fraction in enumerate(candidates, start=1)
-                        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool)
-                        and overlay_y == f"(H-h)*{fraction:.4f}"
-                    ),
-                    None,
-                )
-                if branding["placement"] is None:
-                    logger.warning("Kick branding for %s used an unnumbered fallback position.", run_dir.name)
+                fraction = ai_state.get("kick_overlay_y")
+                if (isinstance(fraction, (int, float)) and not isinstance(fraction, bool)
+                        and ai_state.get("kick_placement_method") == "protected_regions"
+                        and overlay_y == f"(H-h)*{fraction:.4f}"):
+                    branding["method"] = "protected_regions"
+                    branding["fraction"] = fraction
+                else:
+                    branding["method"] = "fallback"
+                    logger.warning("Kick branding for %s used an editor fallback position.", run_dir.name)
             write_json(editor_dir / "branding.json", branding)
             self._write_metadata_files(run_dir, manifest)
             self._mark_edited(run_dir, edited_path)

@@ -90,6 +90,10 @@ class SuccessAlertTests(unittest.TestCase):
         self.branding.write_text('{"mode": "Manual", "placement": null}')
         self.assertIn("Branding: Manual [unavailable: unnumbered fallback]", self.details())
 
+    def test_region_placement_reports_actual_fraction(self):
+        self.branding.write_text('{"mode":"Manual","method":"protected_regions","fraction":0.431}')
+        self.assertIn("Branding: Manual [protected regions, y=0.4310]", self.details())
+
     def test_legacy_metadata_is_unknown_not_invented(self):
         self.manifest.write_text('{"clip_id": "123"}')
         self.branding.unlink()

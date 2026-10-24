@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,28 +18,14 @@ from clipai import kick_placement
 from clipai.config import AppConfig
 from clipai.service import ClipAIService
 
-LAYOUT = kick_placement.Layout(1080, 1920, 108.0)
+
+def response(regions=None):
+    return {"regions": [{"frame": n, **region} for n in (1, 2, 3)
+                        for region in (regions if regions is not None else [{"kind": "face", "top": 0, "bottom": 1}])]}
 
 
 class KickPlacementTests(unittest.TestCase):
-    def test_candidates_include_both_complete_grids(self) -> None:
-        all_spots = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8)
-        self.assertAlmostEqual(0.2, all_spots[0])
-        self.assertLessEqual(all_spots[-1], 0.8)
-        self.assertTrue(all(0.2 <= f <= 0.8 for f in all_spots))
-        primary, staggered = kick_placement.placement_grids(LAYOUT, 0.2, 0.8)
-        self.assertEqual(primary + staggered, all_spots)
-        for grid in (primary, staggered):
-            steps = [(b - a) * LAYOUT.max_y for a, b in zip(grid, grid[1:])]
-            self.assertTrue(all(abs(step - LAYOUT.strip_height * 1.075) < 0.001 for step in steps))
-        self.assertEqual([(a + b) / 2 for a, b in zip(primary, primary[1:])], staggered)
-
-    def test_default_fraction(self) -> None:
-        self.assertEqual(0.5, kick_placement.default_fraction(0.2, 0.8, "BOTH"))
-        self.assertEqual(0.2, kick_placement.default_fraction(0.2, 0.8, "BOTTOM"))
-        self.assertEqual(0.8, kick_placement.default_fraction(0.2, 0.8, "TOP"))
-
-    def _service_and_run(self, temp: str) -> tuple[ClipAIService, Path]:
+    def _service_and_run(self, temp):
         root = Path(temp)
         overlay = root / "overlay.png"
         Image.new("RGB", (1080, 108), (0, 200, 0)).save(overlay)
@@ -49,71 +36,120 @@ class KickPlacementTests(unittest.TestCase):
         config = AppConfig(
             queue_dir=root, poll_interval_seconds=60, google_api_key="k", gemini_model="m", timeout_seconds=30,
             timezone_name="America/New_York", prompts_dir=APP_ROOT.parents[1] / "data" / "prompts",
-            overlay_reference_image_path=overlay, kick_overlay_top_y=0.2, kick_overlay_bottom_y=0.8,
+            overlay_reference_image_path=overlay, kick_overlay_top_y=0.1, kick_overlay_bottom_y=0.8,
         )
         return ClipAIService(config), run_dir
 
-    def test_pick_uses_model_ranking_not_configured_preference(self) -> None:
+    def test_one_flash_call_with_ruler_frames_and_saved_evidence(self):
         with TemporaryDirectory() as temp:
-            service, run_dir = self._service_and_run(temp)
-            count = len(kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8))
-            boxes = [{"number": n, "covers": "x", "clear": n in (2, 3), "confidence": 0.9} for n in range(1, count + 1)]
-            visual = {"caption_position": "TOP", "caption_bands": [{"top": 0, "bottom": 1}],
-                      "has_source_watermark": True, "source_watermark_box": {"x": 0, "y": 0, "w": 1, "h": 1}}
-            with patch.object(service, "_call_gemini", return_value={
-                "boxes": boxes, "ranked_clear_boxes": [2, 3], "confidence": 0.9,
-            }) as call:
-                picked = service._pick_kick_overlay_y(run_dir, visual)
-            self.assertEqual("gemini-3.1-pro-preview", call.call_args.kwargs["model"])
-            self.assertEqual(3, call.call_count)
-            self.assertTrue(all(len(c.kwargs["image_paths"]) == 2 for c in call.call_args_list))
-            fractions = kick_placement.candidate_fractions(LAYOUT, 0.2, 0.8)
-            self.assertEqual([round(fraction, 4) for fraction in fractions], visual["kick_overlay_candidates"])
-            self.assertAlmostEqual(round(fractions[1], 4), picked)
-            self.assertTrue((run_dir / "ai" / "kick_candidates.jpg").exists())
-            with Image.open(run_dir / "ai" / "kick_candidates.jpg") as sheet:
-                self.assertEqual((1644, 1932), sheet.size)
+            service, run = self._service_and_run(temp)
+            visual = {}
+            with patch.object(service, "_call_gemini", return_value=response()) as call:
+                picked = service._pick_kick_overlay_y(run, visual)
+            self.assertEqual(0.8, picked)
+            call.assert_called_once()
+            self.assertEqual("gemini-2.5-flash", call.call_args.kwargs["model"])
+            self.assertEqual(2048, call.call_args.kwargs["thinking_budget"])
+            self.assertEqual(4096, call.call_args.kwargs["max_output_tokens"])
+            self.assertEqual([run / "ai" / f"kick_regions_{n}.jpg" for n in (1, 2, 3)],
+                             call.call_args.kwargs["image_paths"])
+            with Image.open(run / "ai/kick_regions_1.jpg") as image:
+                self.assertEqual((610, 960), image.size)
+            self.assertEqual("protected_regions", visual["kick_placement_method"])
+            evidence = json.loads((run / "ai/kick_placement_results.json").read_text())
+            self.assertEqual("selected", evidence["status"])
+            self.assertEqual(12, evidence["margin"])
+            self.assertFalse(list((run / "ai").glob("kick_frame*")))
+            self.assertNotIn("kick_overlay_candidates", visual)
 
-    def test_invalid_ranking_uses_existing_editor_fallback(self) -> None:
+    def test_ruler_preserves_source_aspect_and_original_file(self):
         with TemporaryDirectory() as temp:
-            service, run_dir = self._service_and_run(temp)
-            for ranking in (None, [], [1], [2, 2], [99], [True]):
-                with self.subTest(ranking=ranking), patch.object(service, "_call_gemini", return_value={
-                    "boxes": [{"number": 1, "covers": "face", "clear": False},
-                              {"number": 2, "covers": "jacket", "clear": True}],
-                    "ranked_clear_boxes": ranking, "confidence": 0.95,
-                }):
-                    self.assertIsNone(service._pick_kick_overlay_y(run_dir, {"caption_position": "BOTTOM"}))
+            source = Path(temp) / "source.jpg"
+            target = Path(temp) / "ruler.jpg"
+            Image.new("RGB", (1920, 1080), "blue").save(source)
+            original = source.read_bytes()
+            self.assertEqual(target, kick_placement.draw_region_ruler(source, target))
+            self.assertEqual(original, source.read_bytes())
+            with Image.open(target) as image:
+                self.assertEqual((610, 304), image.size)
 
-    def test_aggregation_requires_all_frames_and_combines_rank_confidence(self) -> None:
-        def response(order, confidence):
-            return {"boxes": [{"number": n, "clear": n in order, "confidence": confidence[n - 1]} for n in (1, 2, 3)],
-                    "ranked_clear_boxes": order}
-        results = [response([1, 2], [.7, .99, .95]),
-                   response([2, 1], [.7, .99, .95]),
-                   response([2, 1, 3], [.7, .99, .95])]
-        ranking = kick_placement.aggregate_rankings(results, 3)
-        self.assertEqual([2, 1], [r["number"] for r in ranking])
-        results[0]["boxes"][1]["confidence"] = .6
-        self.assertEqual([1], [r["number"] for r in kick_placement.aggregate_rankings(results, 3)])
-        results[0]["boxes"].append(results[0]["boxes"][0])
-        with self.assertRaises(ValueError):
-            kick_placement.aggregate_rankings(results, 3)
-        self.assertEqual([], kick_placement.aggregate_rankings(
-            [response([1], [.95, .95, .95]), response([2], [.95, .95, .95]),
-             response([1, 2], [.95, .95, .95])], 3,
-        ))
-
-    def test_pick_falls_back_when_nothing_clear_or_unsure(self) -> None:
+    def test_existing_overlay_skips_placement(self):
         with TemporaryDirectory() as temp:
-            service, run_dir = self._service_and_run(temp)
-            caption = {"caption_position": "TOP", "caption_bands": []}
-            blocked = {"boxes": [{"number": 1, "covers": "face", "clear": False}], "confidence": 0.95}
-            with patch.object(service, "_call_gemini", return_value=blocked):
-                self.assertIsNone(service._pick_kick_overlay_y(run_dir, caption))
-            unsure = {"boxes": [{"number": 1, "covers": "wall", "clear": True}], "confidence": 0.5}
-            with patch.object(service, "_call_gemini", return_value=unsure):
-                self.assertIsNone(service._pick_kick_overlay_y(run_dir, caption))
+            service, run = self._service_and_run(temp)
+            with patch.object(service, "_detect_overlay_visual", return_value={"has_kick_overlay": True}), \
+                 patch.object(service, "_detect_caption_position", return_value={}), \
+                 patch.object(service, "_detect_source_watermark", return_value={}), \
+                 patch.object(service, "_pick_kick_overlay_y") as pick:
+                self.assertIsNone(service._analyze_visual({}, run_dir=run)["kick_overlay_y"])
+                pick.assert_not_called()
+
+    def test_missing_inputs_skip_paid_call(self):
+        with TemporaryDirectory() as temp:
+            service, run = self._service_and_run(temp)
+            with patch.object(service, "_call_gemini") as call, self.assertLogs(level="WARNING"):
+                self.assertIsNone(service._pick_kick_overlay_y(None, {}))
+                call.assert_not_called()
+
+    def test_invalid_or_no_fit_response_logs_fallback(self):
+        invalid = {"regions": []}
+        blocked = response([{"kind": "face", "top": 0, "bottom": 1000}])
+        for payload, status in ((invalid, "invalid"), (blocked, "no_fit")):
+            with self.subTest(status=status), TemporaryDirectory() as temp:
+                service, run = self._service_and_run(temp)
+                with patch.object(service, "_call_gemini", return_value=payload), self.assertLogs(level="WARNING"):
+                    self.assertIsNone(service._pick_kick_overlay_y(run, {}))
+                evidence = json.loads((run / "ai/kick_placement_results.json").read_text())
+                self.assertEqual(status, evidence["status"])
+
+    def test_source_intervals_map_through_letterboxing(self):
+        layout = kick_placement.Layout(1920, 1080, 108)
+        intervals = kick_placement.protected_intervals(
+            {"regions": [{"frame": 1, "kind": "caption", "top": 0, "bottom": 1000}]},
+            [layout],
+        )
+        self.assertEqual([(656.25, 1263.75)], intervals)
+
+    def test_validation_requires_unique_frames_and_valid_coordinates(self):
+        layout = kick_placement.Layout(1080, 1920, 108)
+        bad = [
+            {}, {"regions": None}, {"regions": [None] * 3}, {"regions": []},
+            {"regions": [{"frame": True, "kind": "face", "top": 0, "bottom": 1}]},
+            {"regions": [{"frame": 4, "kind": "face", "top": 0, "bottom": 1}]},
+            {"regions": [{"frame": 1, "kind": "face", "top": 0, "bottom": 1}]},
+        ]
+        for top, bottom, kind in ((True, 900, "face"), (-1, 10, "face"), (5, 5, "face"),
+                                  (0, 1001, "face"), (0.5, 100, "face"), (0, 100, "")):
+            bad.append(response([{"kind": kind, "top": top, "bottom": bottom}]))
+        for payload in bad:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                kick_placement.protected_intervals(payload, [layout] * 3)
+
+    def test_position_avoids_union_and_maximizes_clearance(self):
+        intervals = [(0, 600), (1100, 1920)]
+        picked = kick_placement.choose_position(intervals, 108, 0.8, 0.1)
+        self.assertIsNotNone(picked)
+        self.assertEqual(12, picked.margin)
+        top = round(1812 * picked.fraction)
+        self.assertGreaterEqual(top, 612)
+        self.assertLessEqual(top + 108, 1088)
+        self.assertAlmostEqual((600 + 1100 - 108) / 2, top, delta=1)
+        self.assertIsNone(kick_placement.choose_position([(0, 1920)], 108, 0.1, 0.8))
+
+    def test_tight_fit_removes_only_extra_margin(self):
+        intervals = [(0, 700), (810, 1920)]
+        picked = kick_placement.choose_position(intervals, 108, 0.1, 0.8)
+        self.assertIsNotNone(picked)
+        self.assertEqual(0, picked.margin)
+        top = round(1812 * picked.fraction)
+        self.assertGreaterEqual(top, 700)
+        self.assertLessEqual(top + 108, 810)
+        self.assertIsNone(kick_placement.choose_position([(0, 700), (807, 1920)], 108, 0.1, 0.8))
+
+    def test_geometry_rejects_invalid_values(self):
+        for height, low, high in ((0, .1, .8), (1920, .1, .8), (108, float("nan"), .8),
+                                  (108, -.1, .8), (108, .1, 1.1)):
+            with self.subTest(height=height, low=low), self.assertRaises(ValueError):
+                kick_placement.choose_position([], height, low, high)
 
 
 if __name__ == "__main__":

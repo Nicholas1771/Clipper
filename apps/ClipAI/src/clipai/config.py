@@ -18,7 +18,7 @@ class AppConfig:
     prompts_dir: Path | None = None
     overlay_reference_image_path: Path | None = None
     watermark_model: str = "gemini-2.5-flash"
-    kick_placement_model: str = "gemini-3.1-pro-preview"
+    kick_placement_model: str = "gemini-2.5-flash"
     context_model: str = "gemini-2.5-flash"
     streamer_name: str = ""
     youtube_selection_mode: str = "shared"
@@ -54,7 +54,7 @@ class AppConfig:
             prompts_dir=prompts_dir if prompts_dir.exists() else None,
             overlay_reference_image_path=overlay_path if overlay_path.exists() else None,
             watermark_model=os.getenv("WATERMARK_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
-            kick_placement_model=os.getenv("KICK_PLACEMENT_MODEL", "gemini-3.1-pro-preview").strip() or "gemini-3.1-pro-preview",
+            kick_placement_model=os.getenv("KICK_PLACEMENT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             streamer_name=os.getenv("STREAMER_NAME", "").strip(),
             context_model=os.getenv("CONTEXT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             youtube_selection_mode=os.getenv("YOUTUBE_SELECTION_MODE", "shared").strip().lower() or "shared",
