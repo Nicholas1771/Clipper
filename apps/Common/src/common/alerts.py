@@ -1,16 +1,58 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import smtplib
 from email.message import EmailMessage
+from html import escape
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from common.env import parse_bool
 
 
 logger = logging.getLogger(__name__)
+
+
+def render_alert_html(body: str, *, section_titles: set[str] | None = None) -> str:
+    sections = {"Source", "Apify", "Gemini AI", "Editor"} | (section_titles or set())
+    rows = []
+    for line in body.splitlines():
+        if not line:
+            rows.append('<tr><td colspan="2" style="height:16px"></td></tr>')
+        elif line in sections:
+            rows.append(
+                '<tr><th colspan="2" style="text-align:left;padding:10px 12px;'
+                f'background:#eef2f6;font-size:17px">{escape(line)}</th></tr>'
+            )
+        else:
+            label, separator, value = line.partition(": ")
+            if not separator:
+                rows.append(f'<tr><td colspan="2" style="padding:4px 12px">{escape(line)}</td></tr>')
+                continue
+            content = escape(value)
+            if label == "Link":
+                try:
+                    url = urlsplit(value)
+                    valid_link = url.scheme in {"http", "https"} and bool(url.netloc)
+                except ValueError:
+                    valid_link = False
+                if valid_link:
+                    content = f'<a href="{escape(value, quote=True)}" style="color:#0969da">{escape(value)}</a>'
+            rows.append(
+                '<tr><th style="text-align:left;vertical-align:top;padding:6px 12px;'
+                f'width:34%;overflow-wrap:anywhere">{escape(label)}</th>'
+                f'<td style="padding:6px 12px;overflow-wrap:anywhere">{content}</td></tr>'
+            )
+    return (
+        '<!doctype html><html><body style="margin:0;padding:20px;background:#f6f8fa;'
+        'color:#1f2328;font:15px/1.5 Arial,sans-serif">'
+        '<table role="presentation" style="width:100%;max-width:760px;margin:auto;'
+        'background:white;border:1px solid #d0d7de;border-collapse:collapse">'
+        + "".join(rows) + "</table></body></html>"
+    )
 
 
 def environment_tag() -> str:
@@ -46,6 +88,8 @@ def format_alert_subject(
     account = os.getenv("ACCOUNT_NAME", "").strip() or "Clipper"
 
     rest = subject.strip()
+    if re.fullmatch(r"Clip (Plan|Start|Report) \d{8} (PROD|LOCAL)( TEST)?", rest):
+        return rest
     patterns = [
         r"^\[(PROD|LOCAL)\]\s*",
         r"^\[(IG|YT|IG/YT)\]\s*",
@@ -63,6 +107,11 @@ def format_alert_subject(
             if cleaned != rest:
                 rest = cleaned
                 changed = True
+
+    publish_outcome = re.match(r"^(Success|Fail)\b", rest, flags=re.IGNORECASE)
+    if publish_outcome:
+        outcome = publish_outcome.group(1).capitalize()
+        return f"Clip {outcome} {plat} {account} {env}"
 
     is_schedule_or_start = bool(re.match(r"^(Schedule|Started)\b", rest, re.IGNORECASE))
     if include_platform is None:
@@ -138,6 +187,42 @@ def send_email_alert(
     except Exception as error:
         logger.warning("Failed to send email alert: %s", error)
         return False
+
+
+def send_scheduled_failure_alert(*, queue_dir: Path, stage: str, error_type: str, details: str) -> bool:
+    try:
+        state = json.loads((queue_dir / "scheduler_state.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        logger.warning("Could not read scheduled slot details for the %s failure alert: %s", stage, error)
+        return False
+    if not isinstance(state, dict) or not state.get("scheduled_for"):
+        logger.warning("Could not send the %s failure alert without scheduled slot details.", stage)
+        return False
+
+    from common.platforms import PLATFORM_LABELS, normalize_platforms
+
+    platforms = normalize_platforms(state.get("platforms"))
+    platform_text = ", ".join(PLATFORM_LABELS[platform] for platform in platforms)
+    platform = PLATFORM_LABELS[platforms[0]] if len(platforms) == 1 else ""
+    creator = str(state.get("creator_name") or "").strip()
+    lines = [
+        "Publish Failure",
+        f"Stage: {stage}",
+        f"Scheduled for: {state['scheduled_for']}",
+        f"Platforms: {platform_text}",
+    ]
+    if creator:
+        lines.append(f"Creator: {creator}")
+    lines.extend(["", "Error", f"Type: {error_type}", f"Details: {details.strip()}"])
+    body = "\n".join(lines) + "\n"
+    html_body = render_alert_html(body, section_titles={"Publish Failure", "Error"})
+    return send_email_alert(
+        app_name=stage,
+        subject=f"Fail - {stage}",
+        body=body,
+        html_body=html_body,
+        platform=platform,
+    )
 
 
 def send_failure_alert(

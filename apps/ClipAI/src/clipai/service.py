@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import requests
 from imageio_ffmpeg import get_ffmpeg_exe
 
-from common.alerts import send_failure_alert
+from common.gemini_usage import request_gemini
 from common.platforms import YOUTUBE, read_slot_platforms
 from common.creators import config_for_run
 from clipai.config import AppConfig
@@ -218,6 +218,7 @@ class ClipAIService:
         temperature: float = 0.2,
         max_output_tokens: int | None = None,
         thinking_budget: int | None = None,
+        stage: str = "analysis",
     ) -> dict[str, Any]:
         """Returns parsed JSON, or {"text": ...} when plain_text is set (free-form output keeps length and paragraphs)."""
         if not self.config.google_api_key:
@@ -254,7 +255,11 @@ class ClipAIService:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
 
         try:
-            response = requests.post(url, json=payload, timeout=(10, self.config.timeout_seconds))
+            response = request_gemini(
+                self.config.queue_dir, model=model or self.config.gemini_model, stage=stage,
+                run_dir=getattr(self, "_usage_run_dir", None),
+                url=url, json=payload, timeout=(10, self.config.timeout_seconds),
+            )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
             raise GeminiRetryableServiceError(f"Gemini request failed due to a network error: {error}") from error
         if response.status_code >= 400:
@@ -408,7 +413,7 @@ class ClipAIService:
             },
             "required": ["has_kick_overlay", "confidence", "evidence"],
         }
-        payload = self._call_gemini(self._build_overlay_prompt(context), response_schema=schema, image_paths=image_paths)
+        payload = self._call_gemini(self._build_overlay_prompt(context), response_schema=schema, image_paths=image_paths, stage="branding")
         evidence = payload.get("evidence")
         evidence_payload = evidence if isinstance(evidence, dict) else {}
         confidence = self._normalize_confidence(payload.get("confidence"))
@@ -451,7 +456,7 @@ class ClipAIService:
             },
             "required": ["has_caption", "caption_position", "text_bands", "confidence", "on_screen_caption"],
         }
-        payload = self._call_gemini(self._build_caption_prompt(context), response_schema=schema, image_paths=image_paths)
+        payload = self._call_gemini(self._build_caption_prompt(context), response_schema=schema, image_paths=image_paths, stage="caption_detection")
         caption_position = self._normalize_caption_position(payload.get("caption_position"))
         has_caption = bool(payload.get("has_caption", False))
         confidence = self._normalize_confidence(payload.get("confidence"))
@@ -545,6 +550,7 @@ class ClipAIService:
             image_paths=[annotated, zoomed],
             model=self.config.watermark_model,
             temperature=0.0,
+            stage="watermark_detection",
         )
         confidence = self._normalize_confidence(payload.get("confidence"))
         labels = payload.get("boxes") if isinstance(payload.get("boxes"), list) else []
@@ -672,6 +678,7 @@ class ClipAIService:
                 prompt, response_schema=schema,
                 image_paths=[run_dir / "ai" / f"kick_frame_{index}_{name}.jpg" for name in ("primary", "staggered")],
                 model=self.config.kick_placement_model, temperature=0.0,
+                stage="kick_placement",
             ))
         evidence = {"frames": results, "fractions": fractions}
         evidence_path = run_dir / "ai" / "kick_placement_results.json"
@@ -731,6 +738,7 @@ class ClipAIService:
                         model=self.config.context_model,
                         max_output_tokens=4096,
                         thinking_budget=0 if self.config.context_model.startswith("gemini-2.5-flash") else None,
+                        stage="transcription_context",
                     )
                     break
                 except GeminiTruncatedResponseError:
@@ -759,7 +767,8 @@ class ClipAIService:
 
     def _generate_summary(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         payload = self._call_gemini(
-            self._build_summary_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True
+            self._build_summary_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True,
+            stage="summary",
         )
         summary = str(payload.get("text") or "").replace("\r", "\n").strip()
         if not summary:
@@ -769,7 +778,8 @@ class ClipAIService:
 
     def _generate_youtube_description(self, caption: str, transcript: str, context_sufficient: bool, on_screen_caption: str = "") -> str:
         payload = self._call_gemini(
-            self._build_youtube_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True
+            self._build_youtube_prompt(caption, transcript, context_sufficient, on_screen_caption), plain_text=True,
+            stage="youtube_metadata",
         )
         text = str(payload.get("text") or "").replace("\r", "\n").strip()
         if not text:
@@ -787,6 +797,7 @@ class ClipAIService:
         return title
 
     def _write_youtube_files(self, run_dir: Path, clip_context: dict[str, Any], fallback_description: str) -> str:
+        self._usage_run_dir = run_dir
         description = fallback_description
         try:
             description = self._generate_youtube_description(
@@ -878,6 +889,7 @@ class ClipAIService:
 
     def process_once(self) -> bool:
         for run_dir in self._ready_items():
+            self._usage_run_dir = run_dir
             self.config = config_for_run(self._base_config, run_dir)
             state = self._load_state(run_dir)
             if state.get("phase") == "ai_processed":
@@ -963,22 +975,13 @@ class ClipAIService:
     def run_forever(self) -> None:
         logger.info("Watching %s for sourced queue items.", self.config.queue_dir)
         consecutive_retryable_failures = 0
-        retryable_alert_sent = False
         while True:
             try:
                 self.process_once()
                 consecutive_retryable_failures = 0
-                retryable_alert_sent = False
                 time.sleep(self.config.poll_interval_seconds)
             except GeminiRateLimitError as error:
                 consecutive_retryable_failures += 1
-                if consecutive_retryable_failures >= 3 and not retryable_alert_sent:
-                    send_failure_alert(
-                        app_name="ClipAI",
-                        error=error,
-                        context=f"retryable Gemini failure persisted for {consecutive_retryable_failures} consecutive cycles",
-                    )
-                    retryable_alert_sent = True
                 if consecutive_retryable_failures > MAX_RETRIES:
                     raise
                 retry_after = error.retry_after_seconds or max(self.config.poll_interval_seconds, 60)
@@ -992,13 +995,6 @@ class ClipAIService:
                 time.sleep(sleep_for)
             except GeminiRetryableServiceError as error:
                 consecutive_retryable_failures += 1
-                if consecutive_retryable_failures >= 3 and not retryable_alert_sent:
-                    send_failure_alert(
-                        app_name="ClipAI",
-                        error=error,
-                        context=f"retryable Gemini failure persisted for {consecutive_retryable_failures} consecutive cycles",
-                    )
-                    retryable_alert_sent = True
                 if consecutive_retryable_failures > MAX_RETRIES:
                     raise
                 retry_after = error.retry_after_seconds or 120

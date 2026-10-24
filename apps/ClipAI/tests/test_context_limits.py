@@ -5,12 +5,16 @@ from unittest.mock import Mock, patch
 
 from clipai.config import AppConfig
 from clipai.service import ClipAIService, GeminiTruncatedResponseError
+from common.gemini_usage import gemini_usage
+from common.reporting import sourcing_run
 
 
 class ContextLimitTests(unittest.TestCase):
     def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
         self.service = ClipAIService(AppConfig(
-            queue_dir=Path("."), poll_interval_seconds=1, google_api_key="test",
+            queue_dir=Path(self.directory.name) / "queue", poll_interval_seconds=1, google_api_key="test",
             gemini_model="gemini-2.5-flash-lite", timeout_seconds=180,
             timezone_name="UTC",
         ))
@@ -37,6 +41,21 @@ class ContextLimitTests(unittest.TestCase):
             with patch("clipai.service.requests.post", return_value=self.response("MAX_TOKENS", text)):
                 with self.assertRaises(GeminiTruncatedResponseError):
                     self.service._call_gemini("audio")
+
+    def test_truncated_usage_is_accounted_before_content_is_rejected(self):
+        response = Mock(status_code=200, json=lambda: {
+            "modelVersion": "gemini-2.5-flash",
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 100, "thoughtsTokenCount": 200},
+            "candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "incomplete"}]}}],
+        })
+        with sourcing_run() as run_id, patch("clipai.service.requests.post", return_value=response):
+            with self.assertRaises(GeminiTruncatedResponseError):
+                self.service._call_gemini("audio", stage="transcription_context")
+        usage = gemini_usage(self.service.config.queue_dir, run_id=run_id)
+        self.assertEqual(1, len(usage.rows))
+        self.assertGreater(usage.cost_cad, 0)
+        self.assertEqual("MAX_TOKENS", usage.rows[0]["finish_reason"])
+        self.assertIn("transcription_context", usage.email_text("run"))
 
     def test_context_fields_and_audio_survive_truncation_retry(self):
         result = {"transcript": "Actual words", "context_sufficient": True, "person_hashtags": ["alice"]}

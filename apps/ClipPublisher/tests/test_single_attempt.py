@@ -82,10 +82,12 @@ class SingleAttemptTests(unittest.TestCase):
             seen = Path(tmp) / "state.json"
             with mock.patch.object(runner_module, "publish_to_instagram", boom), \
                  mock.patch.object(runner_module, "resolve_publish_access_token", lambda c: "t"), \
-                 mock.patch.object(runner_module, "send_failure_alert"), \
+            mock.patch.object(runner_module, "send_email_alert") as failure_email, \
                  mock.patch.object(runner, "_sourcer_seen_ids_path", lambda: seen):
                 with self.assertRaises(RuntimeError):
                     runner.process_one_ready_item()
+                failure_email.assert_called_once()
+                self.assertIn("status_code=ERROR", failure_email.call_args.kwargs["body"])
                 self.assertFalse(runner.process_one_ready_item())
             self.assertEqual(len(calls), 1)
             self.assertEqual([p.name for p in queue.iterdir() if p.name not in {"processing", "Archive", "scheduler_state.json"}], [])

@@ -55,6 +55,17 @@ def _database(queue_dir: Path):
             )
             if "creator" not in {row[1] for row in connection.execute("PRAGMA table_info(posts)")}:
                 connection.execute("ALTER TABLE posts ADD COLUMN creator TEXT NOT NULL DEFAULT ''")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS gemini_attempts "
+                "(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+                "stage TEXT NOT NULL, requested_model TEXT NOT NULL, actual_model TEXT NOT NULL, "
+                "usage_json TEXT, cost_usd TEXT, unknown_reason TEXT NOT NULL, "
+                "pricing_date TEXT NOT NULL, finish_reason TEXT NOT NULL, "
+                "fx_rate TEXT NOT NULL, fx_date TEXT NOT NULL)"
+            )
+            for table in ("usage", "gemini_attempts"):
+                if "creator" not in {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN creator TEXT NOT NULL DEFAULT ''")
             yield connection
     finally:
         connection.close()
@@ -87,10 +98,13 @@ class ApifyUsage:
 
 
 def record_apify_usage(queue_dir: Path, results: int | None, *, now: datetime | None = None) -> None:
+    from common.creators import active_creator_name
+
     with _database(queue_dir) as db:
         db.execute(
-            "INSERT INTO usage VALUES (?, ?, ?)",
-            (_usage_run.get() or uuid4().hex, (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(), results),
+            "INSERT INTO usage (run_id, occurred_at, results, creator) VALUES (?, ?, ?, ?)",
+            (_usage_run.get() or uuid4().hex, (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+             results, active_creator_name.get()),
         )
 
 
@@ -144,21 +158,78 @@ def record_post(
         return False
 
 
-def record_stage_failure(queue_dir: Path, stage: str, error: Exception) -> None:
+def _slot_has_published_post(queue_dir: Path, scheduled_for: str) -> bool | None:
+    if not _database_path(queue_dir).exists():
+        return False
+    try:
+        with _database(queue_dir) as db:
+            return db.execute(
+                "SELECT 1 FROM posts WHERE scheduled_for=? AND status IN ('published', 'success') LIMIT 1",
+                (scheduled_for,),
+            ).fetchone() is not None
+    except (OSError, sqlite3.Error):
+        logger.exception("Could not verify whether the scheduled slot published in %s.", queue_dir)
+        return None
+
+
+def record_stage_failure(queue_dir: Path, stage: str, error: Exception, *, final: bool = False) -> bool:
     path = queue_dir / "scheduler_state.json"
     try:
         if not path.exists():
-            return
+            return False
         state = json.loads(path.read_text(encoding="utf-8"))
-        phases = {"ClipAI": {"scheduled", "source_consumed"}, "ClipEditor": {"ai_processed"}}
-        if isinstance(state, dict) and state.get("phase") in phases[stage]:
+        phases = {
+            "ClipSourcer": {"scheduled", "source_failed"},
+            "ClipAI": {"scheduled", "source_consumed"},
+            "ClipEditor": {"ai_processed"},
+            "ClipPublisher": {"edited", "publishing"},
+        }
+        if not isinstance(state, dict) or state.get("phase") not in phases.get(stage, set()):
+            return False
+        scheduled_for = str(state.get("scheduled_for") or "")
+        if not scheduled_for:
+            return False
+        failure_message = str(error).strip() or "The stage raised an exception without an error message."
+        has_published_post = _slot_has_published_post(queue_dir, scheduled_for)
+        previous_failure = {
+            key: state.get(key)
+            for key in ("failure_stage", "failure_type", "failure_details")
+        }
+        if not final or not previous_failure["failure_details"]:
+            state.update({
+                "failure_stage": stage,
+                "failure_type": type(error).__name__,
+                "failure_details": failure_message,
+            })
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        if not has_published_post:
             record_post(
-                queue_dir, str(state.get("scheduled_for") or ""),
-                state.get("platforms") or ["instagram"], "failed", f"{stage}: {error}",
+                queue_dir, scheduled_for,
+                state.get("platforms") or ["instagram"], "failed", f"{stage}: {failure_message}",
                 creator=str(state.get("creator_name") or ""),
             )
+        if final and has_published_post is None:
+            logger.warning("Withholding the %s failure alert because the slot's publish outcome is unknown.", stage)
+        if final and has_published_post is False and state.get("failure_alert_sent_for") != scheduled_for:
+            from common.alerts import send_scheduled_failure_alert
+
+            alert_stage = str(state.get("failure_stage") or stage)
+            alert_type = str(state.get("failure_type") or type(error).__name__)
+            alert_details = str(state.get("failure_details") or failure_message)
+            if failure_message != alert_details:
+                alert_details = f"{alert_details}\nScheduled publish did not complete: {failure_message}"
+            if send_scheduled_failure_alert(
+                queue_dir=queue_dir,
+                stage=alert_stage,
+                error_type=alert_type,
+                details=alert_details,
+            ):
+                state["failure_alert_sent_for"] = scheduled_for
+                path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return True
     except (OSError, ValueError):
         logger.exception("Could not record %s failure from %s.", stage, path)
+        return False
 
 
 def posts_for_day(queue_dir: Path, day: date, tz_name: str) -> list[dict]:
@@ -226,4 +297,6 @@ def publish_usage_details(
             f"Apify requests: unknown ({reason})\nApify cost: unknown ({reason})\n"
             if compact else f"Apify requests / estimated cost (run): unknown ({reason})\n"
         )
-    return usage_text + cache_remaining_text(cache_file, compact=compact)
+    from common.gemini_usage import gemini_publish_details
+
+    return usage_text + cache_remaining_text(cache_file, compact=compact) + "\nGemini AI\n" + gemini_publish_details(queue_dir, run_dir)

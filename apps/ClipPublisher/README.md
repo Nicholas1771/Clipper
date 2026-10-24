@@ -1,17 +1,21 @@
 # ClipPublisher
 
-Success emails keep their existing subjects and provide a readable HTML layout
-with a plain-text alternative. The publish ID and next scheduled run come first,
-followed by **Source**, **Apify**, and **Editor** sections. Source includes the
-original clickable TikTok link, recorded TikTok views, clip age in hours at notification
-time, creator name, and original caption (not the generated publishing caption). Schedule times
-use the profile's `TIMEZONE_NAME`, displayed as `YYYY-MM-DD HH:MM:SS` without a timezone suffix.
+Success and failure emails use `Clip Success/Fail IG/YT AccountName ENV` subjects
+and provide a readable HTML layout with a plain-text alternative. Success emails
+include the publish ID and next scheduled run, followed by **Source**, **Apify**, and
+**Editor** sections. Source includes the original clickable TikTok link, recorded
+TikTok views, clip age in hours at notification time, creator name, and original
+caption (not the generated publishing caption). Schedule times use the profile's
+`TIMEZONE_NAME`, displayed as `YYYY-MM-DD HH:MM:SS` without a timezone suffix.
 
 Apify shows requests (scraped clips returned), estimated CAD cost at $4.26 per
 1,000 clips, and the live candidate-cache count. Shared-platform emails show the same
 run total, not an additional charge per platform. YouTube replay runs use no Apify
-requests. Failure emails retain their existing diagnostics and usage details.
-Old queue items without usage or source metadata show unknown values rather than guesses.
+requests. Failure emails are sent only when no assigned platform published. They
+identify the failed stage, scheduled slot, platform, creator, and specific error.
+Partial platform failures do not send a failure email when another assigned platform
+successfully published. Old queue items without usage or source metadata show unknown
+values rather than guesses.
 
 Editor branding is `Original` when the original Kick branding was retained, or
 `Manual [6]` (for example) when the editor applied numbered position 6 from the

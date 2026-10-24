@@ -92,6 +92,49 @@ so production will pick different times. Only posts in this machine's local arch
 eligible (production-only archives are not available locally). Do not combine with
 `--now`, `--stop-after`, or `--test`.
 
+Paid Gemini policy checks performed by simulations are still written to the usage
+journal so their cost is not lost; schedule simulation does not make other state changes.
+
+### Gemini AI cost reporting
+
+Emails that include Apify costs also include Gemini AI usage: request count, a known-cost
+subtotal in **CAD**, input/output/thinking token counts grouped by actual model and stage,
+and warnings for unknown-cost attempts in publish alerts. Daily reports instead show
+compact CAD totals with two decimals, combined model costs and account/creator usage,
+without token breakdowns or explanatory footnotes. Unknown attempts remain recorded
+but are excluded from numeric totals. A forward-only Monthly Cost block begins at
+deployment and resets its reporting range on the first of each month.
+Gemini's USD list prices are converted using a saved Bank of Canada
+daily-rate snapshot: **1 USD = 1.4021 CAD (2026-10-22)**. The rate and date are
+persisted per request but omitted from emails; historical estimates do not change if the
+conversion rate is updated later. This is an estimate, not your card's exchange rate.
+
+Each Gemini request is journaled in the account's existing reporting SQLite database
+before sending. Responses are accounted before parsing or checking finish reasons,
+so retries, rejected content and truncated output are charged when usage is supplied.
+Timeouts, interrupted requests, missing/incomplete metadata, unsupported models or
+grounding billing remain explicitly unknown, not free. No prompts, audio, credentials
+or generated text are stored in the usage ledger.
+
+Prices are a **2026-10-22 Standard paid-tier snapshot**, verified against
+[Google's pricing](https://ai.google.dev/gemini-api/docs/pricing), for
+`gemini-2.5-flash-lite`, `gemini-2.5-flash` and `gemini-3.1-pro-preview`.
+Audio input, cached input and Pro's over-200k input tier are priced separately;
+output and thinking tokens are charged once each. Rates live in
+`apps\Common\src\common\gemini_usage.py`. Saved costs retain their original pricing
+date and exchange rate when rates are changed. Free-tier allowances, credits, discounts,
+taxes, explicit-cache storage and card/FX fees are not estimated. FX snapshots are
+verified against the [Bank of Canada](https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=1)
+and maintained alongside the model prices; no pricing/FX network lookup runs while publishing.
+
+Per-post emails show the **cumulative sourcing-run cost**, including screening rejected
+candidates and candidates placed in cache during that run. Cache screening is allocated
+to the run that actually performs it, not recharged when a later run consumes that
+candidate. Subsequent AI processing and YouTube policy checks join the clip's stable
+run ID even after archiving or restart. Replay emails repeat that cumulative run total;
+do not sum post-email totals across platforms. Daily totals count each request once,
+on the date it was sent in the report timezone. Tracking is not retroactive.
+
 The creator selected for a slot supplies its sourcing, identity and branding settings; these are snapshotted on the queued run, never switched globally in another worker.
 
 Obsolete configuration has been removed: Publisher retry/cadence knobs (publishing is single-attempt and Scheduler-owned), scheduler peak-hour knobs (slots use stratified random spacing), Sourcer's legacy independent daily schedule/caps/history files and `OUTPUT_DIR` alias, and old watermark/trim aliases. Existing runtime history files are left untouched.

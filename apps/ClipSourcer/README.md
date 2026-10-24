@@ -13,6 +13,8 @@ history; unverified candidates are never cached. Detector outages fail the attem
 and may be retried, rather than permanently rejecting candidates. This uses shared
 Gemini settings from the AI/root envs and adds download/AI work when fetching a fresh
 batch. False allows sources without branding, with normal editor branding afterward.
+If all scheduled sourcing attempts end without a candidate, a formatted failure email
+reports the attempt results and why no clip could be queued.
 N3on uses false; Navaeh uses true. Existing cache scopes are invalidated when the
 branding policy changes; published seen history is not reset. Caches are isolated by
 account and creator; the account's seen history remains shared.

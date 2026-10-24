@@ -319,6 +319,8 @@ class ServiceTests(unittest.TestCase):
                     {
                         "date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
                         "phase": "scheduled",
+                        "scheduled_for": datetime.now(ZoneInfo("America/New_York")).isoformat(),
+                        "platforms": ["instagram"],
                         "slot_index": 2,
                         "completed_slots": 2,
                     }
@@ -327,12 +329,17 @@ class ServiceTests(unittest.TestCase):
             )
 
             service = ClipSourcerService(config, fetch_items=lambda _config: [])
-            outcome = service.run_once()
+            with patch("common.alerts.send_email_alert", return_value=True) as email:
+                outcome = service.run_once()
 
             self.assertEqual("source_failed", outcome.status)
             payload = json.loads(scheduler_state_path.read_text(encoding="utf-8"))
             self.assertEqual("source_failed", payload["phase"])
             self.assertEqual(3, payload["source_attempts"])
+            self.assertEqual("ClipSourcer", payload["failure_stage"])
+            self.assertEqual(1, email.call_count)
+            self.assertIn("No eligible clip was sourced after 3 attempts", email.call_args.kwargs["body"])
+            self.assertIn("the source returned no candidates", email.call_args.kwargs["body"])
 
     def test_clear_seen_ids_writes_empty_set(self) -> None:
         with TemporaryDirectory() as temp_dir:

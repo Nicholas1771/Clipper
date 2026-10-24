@@ -20,6 +20,7 @@ from clipsourcer.storage import save_seen_ids
 from common.alerts import send_failure_alert
 from common.env import is_test_mode
 from common.logging_utils import configure_app_logging
+from common.reporting import record_stage_failure
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     configure_logging()
+    config = None
     try:
         args = parse_args()
         if args.test:
@@ -81,7 +83,9 @@ def main() -> int:
         return 0
     except Exception as error:
         logger.exception("ClipSourcer failed: %s", error)
-        send_failure_alert(app_name="ClipSourcer", error=error, context="runtime failure")
+        recorded = config is not None and record_stage_failure(config.output_dir, "ClipSourcer", error)
+        if not recorded:
+            send_failure_alert(app_name="ClipSourcer", error=error, context="runtime failure")
         return 1
 
 

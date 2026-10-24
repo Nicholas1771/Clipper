@@ -64,4 +64,4 @@ class DailyReportTests(unittest.TestCase):
                 self.assertEqual(["skipped", "skipped", "in progress"], [row["status"] for row in rows[:3]])
                 runner.run_once(plan.slots[2] + timedelta(hours=3, seconds=1))
             rows = posts_for_day(queue, at(6).date(), "America/New_York")
-            self.assertEqual("abandoned", rows[2]["status"])
+            self.assertEqual("failed", rows[2]["status"])

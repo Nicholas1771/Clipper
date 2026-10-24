@@ -8,17 +8,43 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from common.alerts import send_email_alert
+from common.alerts import environment_tag, render_alert_html, send_email_alert
 from common.env import _find_repo_root, available_accounts, is_test_mode, looks_like_windows_path
 from common.platforms import INSTAGRAM, PLATFORM_LABELS, YOUTUBE
 from common.reporting import ApifyUsage, apify_usage, posts_for_day
+from common.gemini_usage import GeminiUsage, gemini_usage
 from common.creators import configured_creators
 
 logger = logging.getLogger(__name__)
+DISPLAY_TZ = ZoneInfo("America/New_York")
+
+
+def alert_timestamp(when: datetime) -> str:
+    return when.astimezone(DISPLAY_TZ).strftime("%Y%m%d %H:%M:%S")
+
+
+def schedule_rows(slots: list[ScheduleSlot], immediate: ScheduleSlot | None = None) -> list[str]:
+    entries = [(slot, False) for slot in slots]
+    if immediate is not None:
+        entries.append((immediate, True))
+    entries.sort(key=lambda entry: entry[0].time)
+    return [
+        f"{'Run Now' if is_now else 'Run ' + str(index)}: "
+        f"{alert_timestamp(slot.time)} | {slot.label} | {slot.platforms}"
+        for index, (slot, is_now) in enumerate(entries, 1)
+    ] or ["No runs planned."]
+
+LIGHTSAIL_ESTIMATE_START = date(2026, 10, 11)
+LIGHTSAIL_ESTIMATE_AS_OF = date(2026, 10, 22)
+LIGHTSAIL_DAILY_CAD = (
+    Decimal("2.19") * Decimal("1.4021")
+    / (LIGHTSAIL_ESTIMATE_AS_OF - LIGHTSAIL_ESTIMATE_START).days
+)
 
 
 @dataclass
@@ -342,25 +368,20 @@ def build_started_alert_body(
     immediate_slot: ScheduleSlot | None = None,
 ) -> str:
     lines = [
-        f"Clipper Started for {today.strftime('%Y%m%d')} ({tz_name}).",
-        f"Window: {start_hour:02d}:00-{end_hour:02d}:00, posts remaining: {len(remaining_slots)}",
+        "Started",
+        f"Date: {today.strftime('%Y%m%d')}",
+        f"Window: {start_hour:02d}:00-{end_hour:02d}:00",
+        f"Runs remaining: {len(remaining_slots)}",
         "",
-        "Platform Status:",
+        "Status",
     ]
     for account, platforms in profiles_status.items():
-        lines.append(f"* {account}:")
         for plat_name, plat_status in platforms.items():
-            lines.append(f"  - {plat_name}: {plat_status}")
+            if not plat_status.lower().startswith("disabled"):
+                lines.append(f"{account} {plat_name}: {plat_status}")
     lines.append("")
-    lines.append("Remaining Schedule:")
-    if immediate_slot is not None:
-        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.label} | {immediate_slot.platforms}")
-    if remaining_slots:
-        for idx, slot in enumerate(remaining_slots, 1):
-            overdue_str = " (overdue, runs on startup)" if slot.is_overdue else ""
-            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.label} | {slot.platforms}{overdue_str}")
-    else:
-        lines.append("  No runs left in today's window.")
+    lines.append("Remaining Schedule")
+    lines.extend(schedule_rows(remaining_slots, immediate_slot))
     return "\n".join(lines) + "\n"
 
 
@@ -373,19 +394,24 @@ def build_schedule_alert_body(
     immediate_slot: ScheduleSlot | None = None,
 ) -> str:
     lines = [
-        f"Clipper New schedule for {today.strftime('%Y%m%d')} ({tz_name}).",
-        f"Window: {start_hour:02d}:00-{end_hour:02d}:00, posts planned: {len(all_slots)}",
+        "Schedule",
+        f"Date: {today.strftime('%Y%m%d')}",
+        f"Window: {start_hour:02d}:00-{end_hour:02d}:00",
+        f"Runs planned: {len(all_slots) + int(immediate_slot is not None)}",
         "",
-        "Planned Schedule:",
+        "Planned Schedule",
     ]
-    if immediate_slot is not None:
-        lines.append(f"  • Immediate run (--now): {immediate_slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {immediate_slot.label} | {immediate_slot.platforms}")
-    if all_slots:
-        for idx, slot in enumerate(all_slots, 1):
-            lines.append(f"  {idx}. {slot.time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {slot.label} | {slot.platforms}")
-    else:
-        lines.append("  No runs left in today's window.")
+    lines.extend(schedule_rows(all_slots, immediate_slot))
     return "\n".join(lines) + "\n"
+
+
+def schedule_alert_html(body: str) -> str:
+    sections = {
+        "Started", "Schedule", "Daily Report", "Status", "Remaining Schedule",
+        "Planned Schedule", "Post Status", "Usage", "Monthly Cost",
+    }
+    sections.update(line for line in body.splitlines() if line.startswith(("Account - ", "Usage - ")))
+    return render_alert_html(body, section_titles=sections)
 
 
 @contextlib.contextmanager
@@ -546,7 +572,7 @@ def _send_coordinated_plan_alert(
                 end_hour=end_hour,
                 immediate_slot=immediate_slot,
             )
-            subject = f"Started - {today.strftime('%Y%m%d')}"
+            subject = f"Clip Start {today.strftime('%Y%m%d')} {environment_tag()}"
         else:
             body = build_schedule_alert_body(
                 all_slots=all_slots,
@@ -556,13 +582,14 @@ def _send_coordinated_plan_alert(
                 end_hour=end_hour,
                 immediate_slot=immediate_slot,
             )
-            subject = f"Schedule - {today.strftime('%Y%m%d')}"
+            subject = f"Clip Plan {today.strftime('%Y%m%d')} {environment_tag()}"
 
         sender = send_alert_fn or send_email_alert
         if not sender(
             app_name="ClipScheduler",
             subject=subject,
             body=body,
+            html_body=schedule_alert_html(body),
             include_platform=False,
             include_account=False,
         ):
@@ -607,6 +634,8 @@ def send_consolidated_schedule_alert(
 
 
 def build_daily_report_body(repo_root: Path, now: datetime, fallback_config: object) -> str:
+    from common.cost_reports import apify_cost, cost_lines, monthly_cost_lines, usage_between, usage_lines
+
     today = now.date()
     tz_name = getattr(fallback_config, "timezone_name")
     profiles = discover_profile_configs(repo_root)
@@ -614,14 +643,12 @@ def build_daily_report_body(repo_root: Path, now: datetime, fallback_config: obj
     queue_dir = getattr(fallback_config, "queue_dir")
     accounts.setdefault(queue_dir.resolve(), os.getenv("ACCOUNT_NAME", "").strip() or "Clipper")
     slots, _, _ = collect_schedule_slots(repo_root, today, now)
-    lines = [
-        f"Clipper Daily report for {today.strftime('%Y%m%d')} ({tz_name}).",
-        f"Status as of: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        "",
-        "Post Status:",
-    ]
-    total_requests = total_unknown = 0
-    costs = []
+    post_rows = []
+    counts = []
+    ran_accounts = []
+    usage_blocks = []
+    all_apify = []
+    gemini_rows = []
     for queue, account in accounts.items():
         records = {(row["scheduled_for"], row["platform"]): row for row in posts_for_day(queue, today, tz_name)}
         # Plans from before tracking was installed must not be inferred successful from next_index.
@@ -648,12 +675,17 @@ def build_daily_report_body(repo_root: Path, now: datetime, fallback_config: obj
                         }
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 logger.exception("Could not read YouTube post status for %s.", account)
-                lines.append(f"  {account} | YouTube status unavailable (plan could not be read)")
+                post_rows.append((now, f"{account} | YouTube status unavailable"))
+        published_counts: dict[str, int] = {}
+        if any(row["status"] not in {"planned", "pending", "unknown"} for row in records.values()):
+            ran_accounts.append(account)
         for row in sorted(records.values(), key=lambda row: (datetime.fromisoformat(row["scheduled_for"]), row["platform"])):
             when = datetime.fromisoformat(row["scheduled_for"]).astimezone(ZoneInfo(tz_name))
             status = row["status"]
             if status in {"planned", "pending"}:
                 status = "overdue / no recorded publish" if when <= now else "pending"
+            if status in {"published", "success"}:
+                published_counts[row["platform"]] = published_counts.get(row["platform"], 0) + 1
             detail = f" - {row['detail']}" if row["detail"] else ""
             creator = row.get("creator") or next(
                 (slot.creator for slot in slots if slot.account == account and slot.time == when
@@ -661,18 +693,33 @@ def build_daily_report_body(repo_root: Path, now: datetime, fallback_config: obj
                 "",
             )
             creator_text = f"{creator} | " if creator else ""
-            lines.append(
-                f"  {when.strftime('%Y-%m-%d %H:%M:%S %Z')} | {account} | "
-                f"{creator_text}{PLATFORM_LABELS.get(row['platform'], row['platform'])} | {status}{detail}"
-            )
-        if not records:
-            lines.append(f"  {account} | No posts planned or recorded today.")
-        usage = apify_usage(queue, day=today, tz_name=tz_name)
-        total_requests += usage.requests
-        total_unknown += usage.unknown_calls
-        costs.append(f"{account}: {usage.requests:,} scraped clips, ${usage.cost_cad:.4f} CAD")
-    lines.extend(["", "Daily Apify Usage:", *costs, ApifyUsage(total_requests, total_unknown).email_text("day").rstrip()])
-    lines.append("Usage tracking starts when this version is deployed; earlier usage is not included.")
+            post_rows.append((when, f"{alert_timestamp(when)} | {account} | "
+                              f"{creator_text}{PLATFORM_LABELS.get(row['platform'], row['platform'])} | {status}{detail}"))
+        platforms = {row["platform"] for row in records.values()}
+        for platform in sorted(platforms):
+            counts.append(f"{account} {PLATFORM_LABELS.get(platform, platform)} Posts: {published_counts.get(platform, 0)}")
+        start = datetime.combine(today, datetime.min.time(), ZoneInfo(tz_name))
+        apify_rows, ai_usage = usage_between(queue, start, now)
+        all_apify.extend(apify_rows)
+        gemini_rows.extend(ai_usage.rows)
+        if (apify_rows or ai_usage.rows) and account not in ran_accounts:
+            ran_accounts.append(account)
+        creators = sorted({row["creator"] or "Unattributed" for row in [*apify_rows, *ai_usage.rows]})
+        for creator in creators:
+            apify_group = [row for row in apify_rows if (row["creator"] or "Unattributed") == creator]
+            ai_group = GeminiUsage(tuple(row for row in ai_usage.rows if (row["creator"] or "Unattributed") == creator))
+            usage_blocks.extend(["", f"Usage - {account} - {creator}", *usage_lines(apify_group, ai_group)])
+    total_ai = GeminiUsage(tuple(gemini_rows))
+    lines = [
+        "Daily Report", f"Date: {today.strftime('%Y%m%d')}",
+        f"Accounts: {', '.join(ran_accounts) or 'None'}", *counts,
+        *cost_lines(apify_cost(all_apify), total_ai.cost_cad, LIGHTSAIL_DAILY_CAD),
+        "", "Post Status",
+        *[f"Run {index}: {text}" for index, (_, text) in enumerate(sorted(post_rows, key=lambda row: row[0]), 1)],
+        "", "Usage", *usage_lines(all_apify, total_ai), *usage_blocks,
+        "", "Monthly Cost",
+        *monthly_cost_lines(repo_root, list(accounts), now, tz_name, LIGHTSAIL_DAILY_CAD),
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -695,8 +742,9 @@ def send_consolidated_daily_report(
         sender = send_alert_fn or send_email_alert
         if not sender(
             app_name="ClipScheduler",
-            subject=f"Daily report - {now.strftime('%Y%m%d')}",
+            subject=f"Clip Report {now.strftime('%Y%m%d')} {environment_tag()}",
             body=body,
+            html_body=schedule_alert_html(body),
             include_platform=False,
             include_account=False,
         ):

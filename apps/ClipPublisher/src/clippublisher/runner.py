@@ -10,15 +10,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from clippublisher.config import AppConfig
 from clippublisher.models import QueueItem
-from common.alerts import send_email_alert, send_failure_alert
+from common.alerts import render_alert_html, send_email_alert, send_failure_alert
 from clippublisher.instagram_client import publish_to_instagram
 from clippublisher.queue import claim_item, discover_queue_items, is_item_ready, update_scheduler_publish_state
 from clippublisher.youtube_client import is_configured as youtube_is_configured, publish_to_youtube
@@ -152,41 +150,7 @@ def posted_alert_details(config: AppConfig, item: QueueItem, *, replay: bool = F
 
 
 def posted_alert_html(body: str) -> str:
-    rows = []
-    for line in body.splitlines():
-        if not line:
-            rows.append('<tr><td colspan="2" style="height:16px"></td></tr>')
-        elif line in {"Source", "Apify", "Editor"}:
-            rows.append(
-                '<tr><th colspan="2" style="text-align:left;padding:10px 12px;'
-                f'background:#eef2f6;font-size:17px">{line}</th></tr>'
-            )
-        else:
-            label, separator, value = line.partition(": ")
-            if not separator:
-                rows.append(f'<tr><td colspan="2" style="padding:4px 12px">{escape(line)}</td></tr>')
-                continue
-            content = escape(value)
-            if label == "Link":
-                try:
-                    url = urlsplit(value)
-                    valid_link = url.scheme in {"http", "https"} and bool(url.netloc)
-                except ValueError:
-                    valid_link = False
-                if valid_link:
-                    content = f'<a href="{escape(value, quote=True)}" style="color:#0969da">{escape(value)}</a>'
-            rows.append(
-                '<tr><th style="text-align:left;vertical-align:top;padding:6px 12px;'
-                f'white-space:nowrap">{escape(label)}</th>'
-                f'<td style="padding:6px 12px;overflow-wrap:anywhere">{content}</td></tr>'
-            )
-    return (
-        '<!doctype html><html><body style="margin:0;padding:20px;background:#f6f8fa;'
-        'color:#1f2328;font:15px/1.5 Arial,sans-serif">'
-        '<table role="presentation" style="width:100%;max-width:760px;margin:auto;'
-        'background:white;border:1px solid #d0d7de;border-collapse:collapse">'
-        + "".join(rows) + "</table></body></html>"
-    )
+    return render_alert_html(body)
 
 
 def alert_subject(config: AppConfig, clip_id: str, outcome: str) -> str:
@@ -389,22 +353,48 @@ class QueuePublisherRunner:
                 failures[platform] = error
                 logger.exception("%s publish failed for %s: %s", PLATFORM_LABELS.get(platform, platform), claimed.run_dir.name, error)
                 record_post(self.config.queue_dir, scheduled_for, [platform], "failed", str(error), creator=creator_name)
-                send_failure_alert(
-                    app_name="ClipPublisher",
-                    error=error,
-                    context=f"{PLATFORM_LABELS.get(platform, platform)} publish failure for {claimed.run_dir.name}",
-                    clip_id=claimed.clip_id,
-                    details=alert_details(self.config, claimed),
-                    subject=alert_subject(self.config, claimed.clip_id, "Fail"),
-                    platform=PLATFORM_LABELS.get(platform, platform),
-                    title=original_title(claimed.manifest_path, claimed.caption),
-                )
-                setattr(error, "_clipper_alert_sent", True)
 
-        if failures and not results:
-            first_error = next(iter(failures.values()))
-            self._quarantine_failed_item(claimed, first_error)
-            raise first_error
+        if not results:
+            no_publish_error = next(iter(failures.values()), RuntimeError("No assigned platform completed a publish."))
+            manifest = load_json(claimed.manifest_path)
+            manifest = manifest if isinstance(manifest, dict) else {}
+            failure_lines = [
+                "Publish Failure",
+                f"Stage: ClipPublisher",
+                f"Scheduled for: {scheduled_for}",
+                f"Platforms: {', '.join(PLATFORM_LABELS.get(name, name) for name in platforms)}",
+                f"Creator: {creator_name or 'unknown'}",
+                "",
+                "Source",
+                f"Clip ID: {claimed.clip_id}",
+                f"Author: @{claimed.author_handle}",
+                f"Link: {manifest.get('url') or 'unknown'}",
+                "",
+                "Error",
+                f"Type: {type(no_publish_error).__name__}",
+            ]
+            failure_lines.extend(
+                f"{PLATFORM_LABELS.get(name, name)}: {error}"
+                for name, error in failures.items()
+            )
+            failure_lines.extend(
+                f"{PLATFORM_LABELS.get(name, name)}: publish skipped because it is not configured"
+                for name in skipped
+            )
+            if not failures and not skipped:
+                failure_lines.append(f"Details: {no_publish_error}")
+            failure_body = "\n".join(failure_lines) + "\n"
+            email_platform = PLATFORM_LABELS.get(platforms[0], platforms[0]) if len(platforms) == 1 else ""
+            send_email_alert(
+                app_name="ClipPublisher",
+                subject=alert_subject(self.config, claimed.clip_id, "Fail"),
+                body=failure_body,
+                html_body=render_alert_html(failure_body, section_titles={"Publish Failure", "Error"}),
+                platform=email_platform,
+            )
+            setattr(no_publish_error, "_clipper_alert_sent", True)
+            self._quarantine_failed_item(claimed, no_publish_error)
+            raise no_publish_error
 
         publisher_dir = claimed.run_dir / "publisher"
         publisher_dir.mkdir(parents=True, exist_ok=True)

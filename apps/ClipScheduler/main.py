@@ -69,7 +69,7 @@ def main() -> int:
             local_now = runner._local_now()
             day = args.schedule_date or local_now.date() + timedelta(days=1)
             start_of_day = datetime.combine(day, datetime.min.time(), local_now.tzinfo)
-            logger.info("SIMULATION (nothing is saved, sent, sourced or published): start-of-day schedule for %s at %s.", day, start_of_day.isoformat())
+            logger.info("SIMULATION (no plan is saved, no alerts, sourcing or publishing; paid AI usage is journaled): start-of-day schedule for %s at %s.", day, start_of_day.isoformat())
             plan, youtube = runner.simulate_day(start_of_day)
             for index, slot in enumerate(plan.slots):
                 logger.info("  Slot %s: %s [%s] %s", index + 1, slot.strftime("%Y-%m-%d %H:%M:%S %Z"), "+".join(plan.platforms_for(index)) or "none", plan.creator_names[index] if plan.creator_names else "")
@@ -89,7 +89,7 @@ def main() -> int:
                     logger.info("  Excluded %s: %s", item.get("clip_id"), item.get("reason"))
                 if not youtube["entries"]:
                     logger.info("  No eligible Instagram posts; no YouTube upload would be scheduled.")
-            logger.info("Simulation complete: %s pipeline slot(s), %s YouTube slot(s). No files written.", len(plan.slots), len(plan.youtube_slots))
+            logger.info("Simulation complete: %s pipeline slot(s), %s YouTube slot(s). Only paid AI usage accounting may be written.", len(plan.slots), len(plan.youtube_slots))
             return 0
         if args.stop_after:
             return run_until_stage(runner, args.stop_after)

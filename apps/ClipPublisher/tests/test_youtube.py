@@ -10,6 +10,7 @@ from clippublisher import youtube_client
 from clippublisher.config import AppConfig
 from clippublisher.models import QueueItem
 from common.reporting import posts_for_day, record_apify_usage, sourcing_run
+from common.gemini_usage import gemini_usage, request_gemini
 
 from test_single_attempt import make_item
 
@@ -29,7 +30,7 @@ def make_runner(tmp: str, platforms: list[str]):
 
 
 class MultiPlatformTests(unittest.TestCase):
-    def test_success_and_failure_emails_include_run_usage_and_cache_count(self):
+    def test_partial_publish_sends_success_only_and_records_other_platform_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             queue, runner, seen = make_runner(tmp, ["instagram", "youtube"])
             cache = Path(tmp) / "cache.json"
@@ -37,6 +38,10 @@ class MultiPlatformTests(unittest.TestCase):
             when = "2026-10-15T18:00:00+00:00"
             with sourcing_run() as run_id:
                 record_apify_usage(queue, 1000)
+                with mock.patch("common.gemini_usage.requests.post", return_value=mock.Mock(json=lambda: {
+                    "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 100, "thoughtsTokenCount": 200},
+                })):
+                    request_gemini(queue, model="gemini-2.5-flash", stage="context", url="https://example.invalid")
             (queue / "0001_x" / "reporting.json").write_text(json.dumps({
                 "scheduled_for": when, "run_id": run_id, "cache_file": str(cache),
             }))
@@ -44,18 +49,16 @@ class MultiPlatformTests(unittest.TestCase):
                  mock.patch.object(runner_module, "publish_to_youtube", side_effect=RuntimeError("quota")), \
                  mock.patch.object(runner_module, "youtube_is_configured", return_value=True), \
                  mock.patch.object(runner_module, "resolve_publish_access_token", return_value="token"), \
-                 mock.patch.object(runner_module, "send_failure_alert") as failure, \
                  mock.patch.object(runner_module, "send_email_alert") as email, \
                  mock.patch.object(runner, "_sourcer_seen_ids_path", return_value=seen):
                 runner.process_one_ready_item()
-            failure_text = failure.call_args.kwargs["details"]
+            self.assertEqual(1, email.call_count)
             success_text = email.call_args.kwargs["body"]
-            self.assertIn("scraped clips): 1,000", failure_text)
             self.assertIn("Apify requests: 1,000", success_text)
             self.assertIn("Apify cache count: 1", success_text)
-            for text in [failure_text, success_text]:
-                self.assertIn("$4.2600 CAD", text)
-            self.assertIn("cache: 1", failure_text)
+            self.assertIn("$4.2600 CAD", success_text)
+            self.assertIn("Gemini AI calls (run): 1", success_text)
+            self.assertIn("$0.001472 CAD", success_text)
             rows = posts_for_day(queue, date(2026, 10, 15), "UTC")
             self.assertEqual(["published", "failed"], [row["status"] for row in rows])
 
@@ -67,7 +70,6 @@ class MultiPlatformTests(unittest.TestCase):
              mock.patch.object(runner_module, "publish_to_youtube", yt), \
              mock.patch.object(runner_module, "youtube_is_configured", lambda c: yt_configured), \
              mock.patch.object(runner_module, "resolve_publish_access_token", lambda c: "t"), \
-             mock.patch.object(runner_module, "send_failure_alert") as fail_alert, \
              mock.patch.object(runner_module, "send_email_alert") as email, \
              mock.patch.object(runner, "_sourcer_seen_ids_path", lambda: seen):
             try:
@@ -75,11 +77,11 @@ class MultiPlatformTests(unittest.TestCase):
                 error = None
             except RuntimeError as exc:
                 error = exc
-        return queue, seen, ig, yt, fail_alert, email, error
+        return queue, seen, ig, yt, email, error
 
     def test_youtube_only_slot_skips_instagram(self):
         with tempfile.TemporaryDirectory() as tmp:
-            queue, seen, ig, yt, _, email, error = self.run_once(tmp, ["youtube"])
+            queue, seen, ig, yt, email, error = self.run_once(tmp, ["youtube"])
             self.assertIsNone(error)
             ig.assert_not_called()
             yt.assert_called_once()
@@ -89,61 +91,67 @@ class MultiPlatformTests(unittest.TestCase):
 
     def test_instagram_only_slot_skips_youtube(self):
         with tempfile.TemporaryDirectory() as tmp:
-            _, _, ig, yt, _, _, error = self.run_once(tmp, ["instagram"])
+            _, _, ig, yt, _, error = self.run_once(tmp, ["instagram"])
             self.assertIsNone(error)
             ig.assert_called_once()
             yt.assert_not_called()
 
     def test_both_platforms_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
-            _, _, ig, yt, fail_alert, _, error = self.run_once(tmp, ["instagram", "youtube"])
+            _, _, ig, yt, email, error = self.run_once(tmp, ["instagram", "youtube"])
             self.assertIsNone(error)
             ig.assert_called_once()
             yt.assert_called_once()
-            fail_alert.assert_not_called()
+            self.assertEqual(2, email.call_count)
 
     def test_youtube_failure_does_not_block_instagram(self):
         with tempfile.TemporaryDirectory() as tmp:
             yt = mock.Mock(side_effect=RuntimeError("quota"))
-            queue, seen, ig, _, fail_alert, email, error = self.run_once(tmp, ["instagram", "youtube"], yt=yt)
+            queue, seen, ig, _, email, error = self.run_once(tmp, ["instagram", "youtube"], yt=yt)
             self.assertIsNone(error)
             ig.assert_called_once()
-            fail_alert.assert_called_once()
-            self.assertEqual("YouTube", fail_alert.call_args.kwargs["platform"])
+            self.assertEqual(1, email.call_count)
+            self.assertEqual("Instagram", email.call_args.kwargs["platform"])
             self.assertTrue((queue / "Archive" / "0001_x").exists())
             self.assertIn("123", json.loads(seen.read_text())["seen_ids"])
-            self.assertEqual("Instagram", email.call_args.kwargs["platform"])
 
     def test_instagram_failure_does_not_block_youtube(self):
         with tempfile.TemporaryDirectory() as tmp:
             ig = mock.Mock(side_effect=RuntimeError("ig down"))
-            queue, _, _, yt, _, _, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig)
+            queue, _, _, yt, email, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig)
             self.assertIsNone(error)
             yt.assert_called_once()
+            self.assertEqual(1, email.call_count)
             self.assertTrue((queue / "Archive" / "0001_x").exists())
 
     def test_all_platforms_failing_quarantines_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             ig = mock.Mock(side_effect=RuntimeError("ig down"))
             yt = mock.Mock(side_effect=RuntimeError("yt down"))
-            queue, seen, _, _, fail_alert, _, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig, yt=yt)
+            queue, seen, _, _, email, error = self.run_once(tmp, ["instagram", "youtube"], ig=ig, yt=yt)
             self.assertIsNotNone(error)
-            self.assertEqual(2, fail_alert.call_count)
+            email.assert_called_once()
+            self.assertIn("Instagram: ig down", email.call_args.kwargs["body"])
+            self.assertIn("YouTube: yt down", email.call_args.kwargs["body"])
             self.assertTrue((queue / "Archive" / "0001_x_failed").exists())
             self.assertFalse(seen.exists())
 
-    def test_unconfigured_youtube_is_skipped_quietly(self):
+    def test_unconfigured_youtube_sends_failure_when_no_platform_publishes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            queue, seen, _, yt, fail_alert, email, error = self.run_once(tmp, ["youtube"], yt_configured=False)
-            self.assertIsNone(error)
+            queue, seen, _, yt, email, error = self.run_once(tmp, ["youtube"], yt_configured=False)
+            self.assertIsNotNone(error)
             yt.assert_not_called()
-            fail_alert.assert_not_called()
-            email.assert_not_called()
+            email.assert_called_once()
+            self.assertIn("publish skipped because it is not configured", email.call_args.kwargs["body"])
             self.assertFalse(seen.exists())
-            self.assertTrue((queue / "Archive" / "0001_x").exists())
+            self.assertTrue((queue / "Archive" / "0001_x_failed").exists())
 
 
 class YouTubeMetadataTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
     def item(self, **overrides):
         values = dict(run_dir=Path("r"), manifest_path=Path("m"), video_path=Path("v"), clip_id="1", caption="cap", author_handle="a")
         values.update(overrides)
@@ -151,6 +159,7 @@ class YouTubeMetadataTests(unittest.TestCase):
 
     def config(self, **overrides):
         config = mock.MagicMock(spec=AppConfig)
+        config.queue_dir = Path(self.directory.name) / "queue"
         config.youtube_privacy_status = "public"
         config.youtube_category_id = "24"
         config.streamer_hashtag = ""
@@ -220,6 +229,23 @@ class YouTubeMetadataTests(unittest.TestCase):
         self.assertIn("untrusted", payload["systemInstruction"]["parts"][0]["text"])
         self.assertEqual("test-key", post.call_args.kwargs["headers"]["x-goog-api-key"])
         self.assertEqual((10, 180), post.call_args.kwargs["timeout"])
+
+    def test_policy_usage_is_attributed_to_clip_before_rejection(self):
+        run = Path(self.directory.name) / "clip"
+        run.mkdir()
+        (run / "reporting.json").write_text('{"run_id":"policy-run"}')
+        response = self.ai_response(decision="block", reason="Policy violation.")
+        body = response.json()
+        body["usageMetadata"] = {"promptTokenCount": 1000, "candidatesTokenCount": 100}
+        response.json.return_value = body
+        config = self.config()
+        with mock.patch.object(youtube_client.requests, "post", return_value=response):
+            with self.assertRaises(youtube_client.YouTubePolicyError):
+                youtube_client.screen_youtube_content(config, self.item(run_dir=run))
+        usage = gemini_usage(config.queue_dir, run_id="policy-run")
+        self.assertEqual(1, len(usage.rows))
+        self.assertGreater(usage.cost_cad, 0)
+        self.assertEqual("youtube_policy", usage.rows[0]["stage"])
 
     def test_ai_can_allow_quoted_language_previously_blocked_by_keywords(self):
         with mock.patch.object(youtube_client.requests, "post", return_value=self.ai_response()):

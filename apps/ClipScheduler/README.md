@@ -7,6 +7,9 @@ ranking. It is read-only: no plan, history or token writes, no alerts, no sourci
 publishing. Use `--vrlclipmoments` for that account. The direct Scheduler entry point also
 accepts `--schedule` with `CLIPPER_PROFILE` set.
 
+Any paid Gemini policy checks during simulation still update the AI usage journal;
+only accounting is written, never plans, publish history or tokens.
+
 ClipScheduler runs one shared schedule per account. `CREATORS=name:ig_daily:yt_daily,...` in `accounts\<account>.env` supplies separate per-creator platform quotas. Creators are randomly mixed across the generated slots and each slot advances after publish or source failure. Creator assignments and display names persist in the plan, queue marker, simulations and schedule emails.
 
 ## Queue contract
@@ -54,7 +57,7 @@ Set `DAILY_REPORT_TIME=23:00` in the root `.env` to choose the daily report time
 (24-hour `HH:MM`, default 11 PM in `TIMEZONE_NAME`). Keep the report time and timezone
 shared across profiles. The running scheduler sends one consolidated email for all
 profiles, including each scheduled platform's recorded outcome, skipped/failed posts,
-immediate runs, and the day's total estimated Apify cost. A pending post is not treated
+immediate runs, and the day's estimated Apify and Gemini AI costs in CAD. A pending post is not treated
 as successful just because its scheduler slot has advanced. The report is a snapshot;
 posts scheduled after the report time remain pending.
 
@@ -69,3 +72,32 @@ unknown usage and are called out rather than counted as free. Costs are estimate
 not an Apify invoice. Tracking begins with deployment (no historical backfill).
 Usage and post outcomes persist in `<QUEUE_DIR parent>/<QUEUE_DIR name>_reporting.sqlite3`,
 outside the queue's startup cleanup.
+
+Started, Schedule, and Daily Report emails share the publish alert's sectioned HTML
+layout, with a plain-text alternative. Subjects are `Clip Start YYYYMMDD ENV` and
+`Clip Plan YYYYMMDD ENV`; daily report subjects are `Clip Report YYYYMMDD ENV`.
+Started status lists enabled account/platform pairs in one
+block. Display timestamps use fixed EST, `YYYYMMDD HH:MM:SS`, without a zone suffix;
+the configured scheduling timezone is unchanged. Immediate runs appear as `Run Now`.
+
+Daily reports list accounts with activity, successful post counts by account/platform,
+one chronological outcome list, total usage, and usage by account/creator. Model costs
+combine all stages; costs display two CAD decimal places. Unknown attempts remain in
+the usage journal but are excluded from numerical subtotals without email warnings.
+Legacy usage without creator attribution is labeled `Unattributed`.
+
+Only the daily report includes a shared fixed Lightsail hosting estimate, counted
+once across all accounts in the combined total. The baseline is USD $2.19 of
+estimated credit usage over 11 elapsed calendar days (October 11-22, 2026),
+converted at 1.4021 CAD/USD: **CAD $0.279145 per day** (rounded for display).
+This rate remains fixed on subsequent reports, rather than dividing the same spend
+by an ever-growing elapsed period. It represents usage before free-tier credits,
+not an out-of-pocket bill. Alerts omit exchange-rate details.
+
+`Monthly Cost` uses the same four cost rows as the daily summary. Activation time is
+persisted once in `data/monthly_costs.sqlite3`; usage before activation is excluded.
+Each report queries the existing request journals from activation or the first of the
+current month, whichever is later, so retries/restarts cannot double-count costs.
+Hosting is counted once per calendar day from activation within the current month.
+Initialize activation with `common.cost_reports.initialize_monthly_tracking` during
+deployment before restarting workers. No prior-month/day costs are backfilled.

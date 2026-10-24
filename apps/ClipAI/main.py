@@ -71,9 +71,9 @@ def main() -> int:
         return 0
     except Exception as error:
         logger.exception("ClipAI failed: %s", error)
-        if config is not None and not backfill:
-            record_stage_failure(config.queue_dir, "ClipAI", error)
-        send_failure_alert(app_name="ClipAI", error=error, context="runtime failure")
+        recorded = config is not None and not backfill and record_stage_failure(config.queue_dir, "ClipAI", error)
+        if not recorded:
+            send_failure_alert(app_name="ClipAI", error=error, context="runtime failure")
         return 1
 
 

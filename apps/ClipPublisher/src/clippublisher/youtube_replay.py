@@ -654,7 +654,7 @@ class YouTubeReplay:
                     clip_id=entry["clip_id"],
                     details=f"Instagram views yesterday: {entry.get('views')}\nSlot: {entry['slot']}\n"
                     + f"Creator: {entry.get('creator_name') or 'unknown (legacy item)'}\n"
-                    + publish_usage_details(self.config.queue_dir, replay=True),
+                    + publish_usage_details(self.config.queue_dir, run_dir, replay=True),
                     subject=f"Fail [YT replay #{entry.get('rank')}] - {entry['clip_id']}",
                     platform="YouTube",
                     title=original_title(item.manifest_path, item.caption) if item else "",

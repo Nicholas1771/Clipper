@@ -19,7 +19,7 @@ from clipsourcer.downloads import download_video_file
 from clipsourcer.models import ClipCandidate
 from clipsourcer.scoring import has_minimum_views, is_recent, matches_keyword, rank_candidates, viral_score
 from clipsourcer.storage import load_seen_ids, run_timestamp, unique_run_dir, read_queue_state, write_manifest, write_queue_state
-from common.reporting import record_post, sourcing_run
+from common.reporting import record_post, record_stage_failure, sourcing_run
 from common.platforms import read_slot_platforms
 from common.creators import config_for_creator, creator_payload
 from clipsourcer.branding import has_source_kick_branding
@@ -443,17 +443,30 @@ class ClipSourcerService:
             len(unseen_ranked),
         )
         if origin == "Apify":
+            unseen_before_branding = len(unseen_ranked)
             unseen_ranked = self._screen_branding(unseen_ranked, attempted_ids)
         if not unseen_ranked:
-            logger.info("No eligible new clip found in this attempt because all matching clips are already seen or filtered out.")
             self._save_candidate_cache([])
+            if origin == "Apify" and unseen_before_branding:
+                reason = (
+                    "unseen candidates were rejected because required Kick branding was absent "
+                    "or their videos could not be downloaded for branding verification"
+                )
+            elif not candidates:
+                reason = "the source returned no candidates"
+            elif not ranked:
+                reason = "no candidates met the lookback, keyword, and minimum-view requirements"
+            else:
+                reason = "all eligible candidates were already seen or marked as attempted"
+            logger.info("No eligible new clip found in this attempt: %s.", reason)
             return SourcingCycleOutcome(
                 status="no_match",
-                reason="all matching clips were already seen or filtered out",
+                reason=reason,
             )
 
         if origin == "Apify":
             self._save_candidate_cache([candidate for candidate, _score in unseen_ranked])
+        download_failures: list[str] = []
         for best_candidate, score in unseen_ranked:
             if best_candidate.clip_id in attempted_ids:
                 continue
@@ -484,10 +497,12 @@ class ClipSourcerService:
                 downloaded_video_path = download_video_file(self.config, best_candidate)
             except Exception as error:
                 logger.warning("Skipping clip %s because video download failed: %s", best_candidate.clip_id, error)
+                download_failures.append(f"clip {best_candidate.clip_id}: {error}")
                 continue
 
             if self.config.download_video_files and downloaded_video_path is None:
                 logger.warning("Skipping clip %s because no source video file was produced.", best_candidate.clip_id)
+                download_failures.append(f"clip {best_candidate.clip_id}: no source video file was produced")
                 continue
 
             manifest_path = write_manifest(
@@ -539,9 +554,10 @@ class ClipSourcerService:
                 ),
             )
 
+        failure_detail = "; ".join(download_failures) or "no candidate produced a valid downloadable clip"
         return SourcingCycleOutcome(
             status="no_match",
-            reason="ranked candidates were present but none produced a valid downloadable clip",
+            reason=f"ranked candidates were present but none produced a valid downloadable clip: {failure_detail}",
         )
 
     def run_once(self, *, bypass_schedule: bool = False) -> SourcingCycleOutcome:
@@ -582,6 +598,13 @@ class ClipSourcerService:
                     self.config.output_dir, scheduled_for, platforms, "failed", outcome.reason or "Sourcing failed",
                     creator=self._creator.get("display_name", ""),
                 )
+            if outcome.status == "source_failed":
+                record_stage_failure(
+                    self.config.output_dir,
+                    "ClipSourcer",
+                    RuntimeError(outcome.reason or "No eligible clip was sourced after the scheduled attempts."),
+                    final=True,
+                )
             return outcome
 
     def _run_once(self, *, bypass_schedule: bool = False) -> SourcingCycleOutcome:
@@ -602,6 +625,7 @@ class ClipSourcerService:
             logger.info("Running one-off sourcing cycle immediately; ignoring the scheduler gate.")
         attempts = self.config.source_attempts_per_slot if scheduler_ready and not bypass_schedule else 1
         last_outcome = SourcingCycleOutcome(status="no_match", reason="no sourcing attempt was executed")
+        attempt_reasons: list[str] = []
         for attempt_number in range(1, attempts + 1):
             logger.info("Sourcing attempt %s/%s for the current scheduler slot.", attempt_number, attempts)
             try:
@@ -609,14 +633,19 @@ class ClipSourcerService:
             except Exception as error:
                 logger.warning("Sourcing attempt %s/%s failed with an exception: %s", attempt_number, attempts, error)
                 last_outcome = SourcingCycleOutcome(status="error", reason=str(error))
+                attempt_reasons.append(f"attempt {attempt_number}: {type(error).__name__}: {error}")
                 continue
             last_outcome = outcome
             if outcome.status == "sourced":
                 return outcome
+            attempt_reasons.append(f"attempt {attempt_number}: {outcome.reason or outcome.status}")
             logger.info("Sourcing attempt %s/%s ended without a valid clip: %s", attempt_number, attempts, outcome.reason)
 
         if scheduler_ready and not bypass_schedule and isinstance(scheduler_state, dict) and scheduler_state_path.exists():
-            failure_reason = last_outcome.reason or "no valid clip was available after the scheduled retries"
+            failure_reason = (
+                f"No eligible clip was sourced after {attempts} attempts. "
+                + "; ".join(attempt_reasons)
+            )
             self._mark_scheduler_source_failed(
                 scheduler_state_path,
                 scheduler_state,

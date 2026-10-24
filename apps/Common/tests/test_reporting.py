@@ -16,6 +16,7 @@ from common.reporting import (
     publish_usage_details, record_apify_usage, record_post, record_stage_failure, sourcing_run,
 )
 from common.schedule_alerts import build_daily_report_body, send_consolidated_daily_report
+from common.gemini_usage import request_gemini
 
 
 class ReportingTests(unittest.TestCase):
@@ -47,6 +48,9 @@ class ReportingTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.queue = self.root / "queue"
         self.queue.mkdir()
+        from common.creators import active_creator_name
+        token = active_creator_name.set("")
+        self.addCleanup(active_creator_name.reset, token)
 
     def test_usage_is_per_scraped_clip_and_per_run_including_fallbacks(self):
         with sourcing_run() as first:
@@ -97,13 +101,64 @@ class ReportingTests(unittest.TestCase):
         marker = self.queue / "scheduler_state.json"
         for stage, phase in [("ClipAI", "source_consumed"), ("ClipEditor", "ai_processed")]:
             marker.write_text(json.dumps({"scheduled_for": when, "platforms": ["instagram"], "phase": phase}))
-            record_stage_failure(self.queue, stage, RuntimeError("service down"))
+            with mock.patch("common.alerts.send_email_alert") as email:
+                self.assertTrue(record_stage_failure(self.queue, stage, RuntimeError("service down")))
+                email.assert_not_called()
             row = posts_for_day(self.queue, date(2026, 10, 15), "UTC")[0]
             self.assertEqual("failed", row["status"])
             self.assertEqual(f"{stage}: service down", row["detail"])
         marker.write_text(json.dumps({"scheduled_for": when, "phase": "complete"}))
         record_stage_failure(self.queue, "ClipAI", RuntimeError("unrelated"))
         self.assertEqual(row, posts_for_day(self.queue, date(2026, 10, 15), "UTC")[0])
+
+    def test_final_stage_failure_sends_one_formatted_alert_only_when_no_publish_completed(self):
+        when = "2026-10-15T18:00:00+00:00"
+        marker = self.queue / "scheduler_state.json"
+        marker.write_text(json.dumps({
+            "scheduled_for": when,
+            "platforms": ["instagram", "youtube"],
+            "creator_name": "Cuffem",
+            "phase": "source_consumed",
+        }))
+        mail_settings = {
+            "ACCOUNT_NAME": "KickzsClipz",
+            "ENVIRONMENT": "PROD",
+            "ALERT_EMAIL_ENABLED": "true",
+            "ALERT_EMAIL_SMTP_HOST": "smtp.example.com",
+            "ALERT_EMAIL_FROM": "sender@example.com",
+            "ALERT_EMAIL_TO": "recipient@example.com",
+        }
+        with mock.patch.dict(os.environ, mail_settings), mock.patch("common.alerts.smtplib.SMTP") as smtp:
+            self.assertTrue(record_stage_failure(self.queue, "ClipAI", RuntimeError("Gemini timed out")))
+            self.assertTrue(record_stage_failure(self.queue, "ClipAI", RuntimeError("No publish after timeout"), final=True))
+            self.assertTrue(record_stage_failure(self.queue, "ClipAI", RuntimeError("still no publish"), final=True))
+        sent = smtp.return_value.__enter__.return_value.send_message
+        sent.assert_called_once()
+        message = sent.call_args.args[0]
+        self.assertEqual("Clip Fail IG/YT KickzsClipz PROD", message["Subject"])
+        body = message.get_body(preferencelist=("plain",)).get_content()
+        self.assertIn("Stage: ClipAI", body)
+        self.assertIn("Scheduled for: 2026-10-15T18:00:00+00:00", body)
+        self.assertIn("Creator: Cuffem", body)
+        self.assertIn("Type: RuntimeError", body)
+        self.assertIn("Gemini timed out", body)
+        self.assertIn("No publish after timeout", body)
+        self.assertIn("multipart/alternative", message.get_content_type())
+
+    def test_final_stage_failure_does_not_alert_after_another_platform_published(self):
+        when = "2026-10-15T18:00:00+00:00"
+        marker = self.queue / "scheduler_state.json"
+        marker.write_text(json.dumps({
+            "scheduled_for": when,
+            "platforms": ["instagram", "youtube"],
+            "phase": "ai_processed",
+        }))
+        record_post(self.queue, when, ["instagram"], "published", "ig123")
+        with mock.patch("common.alerts.send_email_alert") as email:
+            self.assertTrue(record_stage_failure(
+                self.queue, "ClipEditor", RuntimeError("editor reported an error"), final=True,
+            ))
+        email.assert_not_called()
 
     def test_status_journal_failure_is_logged_without_reclassifying_publish(self):
         with mock.patch("common.reporting.sqlite3.connect", side_effect=sqlite3.OperationalError("disk full")), \
@@ -123,7 +178,8 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("$0.1065 CAD", body)
         self.assertIn("cache: 2", body)
         compact = publish_usage_details(self.queue, run, compact=True)
-        self.assertEqual("Apify requests: 25\nApify cost: $0.1065 CAD\nApify cache count: 2\n", compact)
+        self.assertTrue(compact.startswith("Apify requests: 25\nApify cost: $0.1065 CAD\nApify cache count: 2\n"))
+        self.assertIn("Gemini AI cost (run): unknown", compact)
         self.assertIn("predates usage tracking", publish_usage_details(self.queue))
         with mock.patch.dict(os.environ, {"CANDIDATE_CACHE_FILE": str(cache)}):
             replay = publish_usage_details(self.queue, run, replay=True)
@@ -149,6 +205,16 @@ class ReportingTests(unittest.TestCase):
         record_apify_usage(self.queue, 1000, now=now)
         record_apify_usage(other, 500, now=now)
         record_apify_usage(other, None, now=now)
+        with mock.patch("common.gemini_usage.requests.post", return_value=mock.Mock(json=lambda: {
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 100, "thoughtsTokenCount": 200},
+        })):
+            request_gemini(self.queue, model="gemini-2.5-flash", stage="context", url="https://example.invalid")
+            request_gemini(other, model="gemini-2.5-flash", stage="summary", url="https://example.invalid")
+        from common.reporting import _database
+
+        for queue in (self.queue, other):
+            with _database(queue) as db:
+                db.execute("UPDATE gemini_attempts SET occurred_at=?", (now.astimezone(timezone.utc).isoformat(),))
         (self.queue / "youtube_plan.json").write_text(json.dumps({
             "date": "2026-10-15", "entries": [{
                 "scheduled_for": "2026-10-15T11:00:00-04:00", "status": "published", "clip_id": "replay",
@@ -165,9 +231,33 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("One | YouTube | failed - quota", body)
         self.assertIn("One | Nevaeh | YouTube | published - replay", body)
         self.assertIn("Two | Instagram | skipped", body)
-        self.assertIn("scraped clips): 1,500", body)
-        self.assertIn("$6.3900 CAD", body)
-        self.assertIn("usage/cost is unknown", body)
+        self.assertIn("Apify requests: 1,500", body)
+        self.assertIn("Apify cost: $6.39 CAD", body)
+        self.assertIn("Usage\n", body)
+        self.assertIn("Usage - One - Unattributed\n", body)
+        self.assertIn("Usage - Two - Unattributed\n", body)
+        self.assertIn("AI cost: $0.00 CAD", body)
+        self.assertIn("Hosting cost: $0.28 CAD", body)
+        self.assertIn("Total cost: $6.67 CAD", body)
+        self.assertNotIn("CAD conversion", body)
+        self.assertIn("One Instagram Posts: 1", body)
+        self.assertIn("One YouTube Posts: 1", body)
+        self.assertIn("AI calls: 2", body)
+        self.assertIn("Monthly Cost\n", body)
+        for removed in ("Timezone", "Status as of", "Daily Totals", "Published:", "Usage Notes", "tokens", "Standard paid-tier", "(", ")"):
+            self.assertNotIn(removed, body)
+
+    def test_hosting_estimate_is_fixed_across_report_dates_and_charged_once(self):
+        from common.schedule_alerts import LIGHTSAIL_DAILY_CAD
+
+        self.assertEqual(Decimal("2.19") * Decimal("1.4021") / 11, LIGHTSAIL_DAILY_CAD)
+        config = SimpleNamespace(queue_dir=self.queue, timezone_name="UTC")
+        with mock.patch("common.schedule_alerts.discover_profile_configs", return_value=[]):
+            for day in (22, 30):
+                body = build_daily_report_body(self.root, datetime(2026, 10, day, 23, tzinfo=timezone.utc), config)
+                daily = body.split("Post Status")[0]
+                self.assertEqual(1, daily.count("Hosting cost: $0.28 CAD"))
+                self.assertIn("Total cost: $0.28 CAD", daily)
 
     def test_daily_report_deduplicates_across_restarts_and_retries_failed_delivery(self):
         config = SimpleNamespace(queue_dir=self.queue, timezone_name="UTC")
@@ -179,5 +269,8 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue(send_consolidated_daily_report(self.root, now, config, sender))
             self.assertTrue(send_consolidated_daily_report(self.root, now, config, sender))
         self.assertEqual(2, sender.call_count)
+        self.assertRegex(sender.call_args.kwargs["subject"], r"^Clip Report 20261015 (LOCAL|PROD)$")
+        self.assertIn(">Daily Report</th>", sender.call_args.kwargs["html_body"])
+        self.assertIn(">Monthly Cost</th>", sender.call_args.kwargs["html_body"])
         self.assertFalse(sender.call_args.kwargs["include_account"])
         self.assertFalse(sender.call_args.kwargs["include_platform"])

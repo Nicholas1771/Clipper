@@ -74,6 +74,8 @@ class SuccessAlertTests(unittest.TestCase):
             "Apify requests: 25\n"
             "Apify cost: $0.1065 CAD\n"
             "Apify cache count: 0\n\n"
+            "Gemini AI\n"
+            "Gemini AI cost (run): unknown (no recorded Gemini usage; tracking is not retroactive)\n\n"
             "Editor\n"
             "Branding: Manual [6]\n",
             call["body"],

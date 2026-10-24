@@ -152,8 +152,11 @@ def screen_youtube_content(config: AppConfig, item: QueueItem) -> YouTubeApprova
     prompt = _read_screening_prompt(config)
     content = _screening_content(config, item)
     try:
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent",
+        from common.gemini_usage import request_gemini
+
+        response = request_gemini(
+            config.queue_dir, model=config.gemini_model, stage="youtube_policy", run_dir=item.run_dir,
+            url=f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent",
             headers={"x-goog-api-key": config.google_api_key},
             json={
                 "systemInstruction": {"parts": [{"text": prompt}]},

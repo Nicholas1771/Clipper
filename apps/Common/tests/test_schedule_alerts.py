@@ -15,6 +15,7 @@ from common.schedule_alerts import (
     ProfileConfig,
     ScheduleSlot,
     _profile_plans_ready,
+    alert_timestamp,
     build_schedule_alert_body,
     build_started_alert_body,
     check_platform_status,
@@ -22,12 +23,20 @@ from common.schedule_alerts import (
     discover_profile_configs,
     send_consolidated_schedule_alert,
     send_consolidated_started_alert,
+    schedule_alert_html,
 )
 
 TZ = ZoneInfo("America/New_York")
 
 
 class ScheduleAlertFormattingTests(unittest.TestCase):
+    def test_alert_timestamp_uses_dst_aware_eastern_time(self):
+        summer = datetime(2026, 10, 24, 1, 22, tzinfo=timezone.utc)
+        winter = datetime(2026, 1, 24, 2, 22, tzinfo=timezone.utc)
+
+        self.assertEqual("20261023 21:22:00", alert_timestamp(summer))
+        self.assertEqual("20260123 21:22:00", alert_timestamp(winter))
+
     def test_creator_names_appear_in_schedule_and_started_emails(self):
         slot = ScheduleSlot(
             time=datetime(2026, 10, 19, 18, tzinfo=TZ), account="ExampleAccount",
@@ -201,17 +210,17 @@ class ScheduleAlertFormattingTests(unittest.TestCase):
             start_hour=8,
             end_hour=23,
         )
-        self.assertIn("Clipper Started for 20261012 (America/New_York).", body)
-        self.assertIn("posts remaining: 2", body)
-        self.assertIn("Platform Status:", body)
-        self.assertIn("* CarootClips:", body)
-        self.assertIn("- Instagram: OK", body)
-        self.assertIn("- YouTube: OK", body)
-        self.assertIn("* VrlClipMoments:", body)
-        self.assertIn("- Instagram: ERROR - INSTAGRAM_USER_ID is required for publishing", body)
-        self.assertIn("Remaining Schedule:", body)
-        self.assertIn("1. 2026-10-12 20:58:27 EDT | CarootClips | Instagram", body)
-        self.assertIn("2. 2026-10-12 21:41:23 EDT | VrlClipMoments | Instagram, YouTube", body)
+        self.assertTrue(body.startswith("Started\nDate: 20261012\n"))
+        self.assertIn("Runs remaining: 2", body)
+        self.assertIn("Status\n", body)
+        self.assertIn("CarootClips Instagram: OK", body)
+        self.assertIn("Instagram: OK", body)
+        self.assertIn("YouTube: OK", body)
+        self.assertIn("VrlClipMoments Instagram:", body)
+        self.assertIn("Instagram: ERROR - INSTAGRAM_USER_ID is required for publishing", body)
+        self.assertIn("Remaining Schedule\n", body)
+        self.assertIn("Run 1: 20261012 20:58:27 | CarootClips | Instagram", body)
+        self.assertIn("Run 2: 20261012 21:41:23 | VrlClipMoments | Instagram, YouTube", body)
 
     def test_build_schedule_alert_body_ordering(self):
         slots = [
@@ -238,12 +247,38 @@ class ScheduleAlertFormattingTests(unittest.TestCase):
             start_hour=8,
             end_hour=23,
         )
-        self.assertIn("Clipper New schedule for 20261012 (America/New_York).", body)
-        self.assertIn("posts planned: 3", body)
-        self.assertIn("Planned Schedule:", body)
-        self.assertIn("1. 2026-10-12 10:08:06 EDT | CarootClips | Instagram", body)
-        self.assertIn("2. 2026-10-12 11:09:15 EDT | VrlClipMoments | Instagram", body)
-        self.assertIn("3. 2026-10-12 16:52:31 EDT | CarootClips | Instagram, YouTube", body)
+        self.assertTrue(body.startswith("Schedule\nDate: 20261012\n"))
+        self.assertIn("Runs planned: 3", body)
+        self.assertIn("Planned Schedule\n", body)
+        self.assertIn("Run 1: 20261012 10:08:06 | CarootClips | Instagram", body)
+        self.assertIn("Run 2: 20261012 11:09:15 | VrlClipMoments | Instagram", body)
+        self.assertIn("Run 3: 20261012 16:52:31 | CarootClips | Instagram, YouTube", body)
+
+    def test_html_sections_escape_account_and_status_and_keep_schedule_times(self):
+        slot = ScheduleSlot(datetime(2026, 10, 12, 18, tzinfo=timezone.utc), "<Account>", "Instagram", is_overdue=True)
+        body = build_started_alert_body(
+            {"<Account>": {"Instagram": "ERROR - <expired> & unavailable"}},
+            [slot], date(2026, 10, 12), "America/New_York", 8, 23, immediate_slot=slot,
+        )
+        self.assertIn("20261012 14:00:00", body)
+        self.assertNotIn("overdue", body)
+        self.assertIn("Run Now:", body)
+        self.assertNotIn("Immediate run", body)
+        html = schedule_alert_html(body)
+        self.assertIn("background:#eef2f6", html)
+        self.assertIn("&lt;Account&gt; Instagram", html)
+        self.assertIn("ERROR - &lt;expired&gt; &amp; unavailable", html)
+        self.assertNotIn("<Account>", html)
+
+    def test_all_plan_alerts_send_html_and_plain_text(self):
+        for alert in (send_consolidated_started_alert, send_consolidated_schedule_alert):
+            with self.subTest(alert=alert.__name__), TemporaryDirectory() as tmp:
+                sender = mock.Mock(return_value=True)
+                self.assertTrue(alert(Path(tmp), datetime(2026, 10, 12, 8, tzinfo=TZ), send_alert_fn=sender))
+                call = sender.call_args.kwargs
+                self.assertEqual(schedule_alert_html(call["body"]), call["html_body"])
+                self.assertFalse(call["include_account"])
+                self.assertFalse(call["include_platform"])
 
     def test_schedule_alert_deduplication_for_same_date(self):
         with TemporaryDirectory() as tmp:

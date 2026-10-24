@@ -19,7 +19,7 @@ from common.alerts import send_email_alert
 from common.env import _find_repo_root, is_test_mode, looks_like_windows_path
 from common.platforms import INSTAGRAM, PLATFORM_LABELS, PLATFORMS, YOUTUBE, normalize_platforms
 from common.schedule_alerts import send_consolidated_daily_report, send_consolidated_schedule_alert, send_consolidated_started_alert
-from common.reporting import record_post
+from common.reporting import record_post, record_stage_failure
 from common.creators import Creator
 
 logger = logging.getLogger(__name__)
@@ -630,6 +630,19 @@ class ClipSchedulerRunner:
             last_update = self._parse_time(state.get("updated_at")) or self._parse_time(state.get("scheduled_for"))
             if last_update is not None and now - last_update > timedelta(hours=STALE_CYCLE_HOURS):
                 logger.warning("Abandoning stale scheduler cycle (phase=%s, last update %s).", phase, last_update.isoformat())
+                stage = {
+                    "scheduled": "ClipSourcer",
+                    "source_consumed": "ClipAI",
+                    "ai_processed": "ClipEditor",
+                    "edited": "ClipPublisher",
+                    "publishing": "ClipPublisher",
+                }.get(phase, "ClipScheduler")
+                record_stage_failure(
+                    self.config.queue_dir,
+                    stage,
+                    RuntimeError(f"No publish completed within {STALE_CYCLE_HOURS} hours while the slot was at {phase}."),
+                    final=True,
+                )
                 record_post(
                     self.config.queue_dir, str(state.get("scheduled_for") or ""),
                     state.get("platforms") or [INSTAGRAM], "abandoned", f"No progress for {STALE_CYCLE_HOURS} hours",

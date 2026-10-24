@@ -50,9 +50,9 @@ def main() -> int:
         return 0
     except Exception as error:
         logger.exception("ClipEditor failed: %s", error)
-        if config is not None:
-            record_stage_failure(config.queue_dir, "ClipEditor", error)
-        send_failure_alert(app_name="ClipEditor", error=error, context="runtime failure")
+        recorded = config is not None and record_stage_failure(config.queue_dir, "ClipEditor", error)
+        if not recorded:
+            send_failure_alert(app_name="ClipEditor", error=error, context="runtime failure")
         return 1
 
 

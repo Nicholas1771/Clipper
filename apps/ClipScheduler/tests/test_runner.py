@@ -422,7 +422,7 @@ class RestartTests(unittest.TestCase):
         plan = second.ensure_plan(at(11))
         self.assertEqual(original, plan.slots)
         subject = self.alert.call_args.kwargs["subject"]
-        self.assertTrue(subject.startswith("Started"))
+        self.assertTrue(subject.startswith("Clip Start "))
         self.assertIn("remaining", self.alert.call_args.kwargs["body"])
 
     def test_restart_after_completed_slots_only_lists_remaining(self) -> None:
@@ -462,14 +462,14 @@ class RestartTests(unittest.TestCase):
         second = self.restart()
         resumed = second.ensure_plan(at(23))
         self.assertEqual(plan.slots, resumed.slots)
-        self.assertIn("No runs left", self.alert.call_args.kwargs["body"])
+        self.assertIn("No runs planned.", self.alert.call_args.kwargs["body"])
 
     def test_restart_next_day_generates_new_plan(self) -> None:
         make_runner(self.queue).ensure_plan(at(6))
         second = self.restart()
         plan = second.ensure_plan(at(6, day=7))
         self.assertTrue(all(slot.day == 7 for slot in plan.slots))
-        self.assertTrue(self.alert.call_args.kwargs["subject"].startswith("Started"))
+        self.assertTrue(self.alert.call_args.kwargs["subject"].startswith("Clip Start "))
 
     def test_stop_after_archives_stale_queue_before_firing_fresh_cycle(self) -> None:
         runner = make_runner(self.queue)
@@ -498,7 +498,7 @@ class RestartTests(unittest.TestCase):
         second = self.restart()
         late = plan.slots[3] + timedelta(minutes=5)
         second.run_once(late)
-        self.assertIn("overdue", self.alert.call_args.kwargs["body"])
+        self.assertIn("Remaining Schedule", self.alert.call_args.kwargs["body"])
         self.assertEqual(4, second._plan.next_index)
 
 
