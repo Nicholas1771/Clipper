@@ -82,5 +82,45 @@ class MergeSeenIdsTests(unittest.TestCase):
         self.assertEqual(1, result["added"])
 
 
+class SshFileTests(unittest.TestCase):
+    def test_local_files_preferred_and_empty_files_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            home = Path(tmp) / "home"
+            (root / ".ssh").mkdir(parents=True)
+            with mock.patch.object(sync_seen_ids, "REPO_ROOT", root), \
+                 mock.patch.object(Path, "home", return_value=home):
+                for name in ("clipper-ec2.pem", "known_hosts"):
+                    fallback = home / ".ssh" / name
+                    self.assertEqual(sync_seen_ids.ssh_file(name), fallback)
+                    local = root / ".ssh" / name
+                    local.touch()
+                    self.assertEqual(sync_seen_ids.ssh_file(name), fallback)
+                    local.write_text("test fixture\n", encoding="utf-8")
+                    self.assertEqual(sync_seen_ids.ssh_file(name), local)
+
+    def test_key_override_resolves_relative_to_repo_not_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sync_seen_ids, "REPO_ROOT", Path(tmp)), \
+             mock.patch.dict("os.environ", {"PRODUCTION_SSH_KEY": ".ssh/custom.pem"}):
+            self.assertEqual(sync_seen_ids.production_ssh_key(), Path(tmp) / ".ssh" / "custom.pem")
+            with mock.patch.dict("os.environ", {"PRODUCTION_SSH_KEY": str(Path(tmp) / "absolute.pem")}):
+                self.assertEqual(sync_seen_ids.production_ssh_key(), Path(tmp) / "absolute.pem")
+
+    def test_push_uses_selected_key_and_known_hosts_with_strict_verification(self):
+        completed = mock.Mock(returncode=0, stdout='{"before": 0, "added": 0, "after": 0}', stderr="")
+        with mock.patch.object(sync_seen_ids, "resolve_state_file"), \
+             mock.patch.object(sync_seen_ids, "read_seen_ids", return_value=set()), \
+             mock.patch.object(sync_seen_ids, "production_ssh_key", return_value=Path("key with spaces")), \
+             mock.patch.object(sync_seen_ids, "ssh_file", return_value=Path("hosts with spaces")), \
+             mock.patch.object(sync_seen_ids, "production_host", return_value="example.invalid"), \
+             mock.patch.object(sync_seen_ids.subprocess, "run", return_value=completed) as run:
+            sync_seen_ids.push("example", dry_run=True)
+            command = run.call_args.args[0]
+            self.assertIn("key with spaces", command)
+            self.assertIn('UserKnownHostsFile="hosts with spaces"', command)
+            self.assertIn("StrictHostKeyChecking=yes", command)
+
+
 if __name__ == "__main__":
     unittest.main()

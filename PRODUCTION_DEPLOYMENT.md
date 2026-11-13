@@ -16,26 +16,70 @@
 - AWS region: `us-east-2`
 - Host and EC2 instance ID are stored in the ignored root `.env` as `PRODUCTION_HOST` and `PRODUCTION_INSTANCE_ID`.
 - SSH user: `ubuntu`
-- SSH key: `%USERPROFILE%\.ssh\clipper-ec2.pem`
+- SSH key: repository-local `.ssh\clipper-ec2.pem`; falls back to `$HOME\.ssh\clipper-ec2.pem` when absent or empty.
 - Remote application directory: `/home/ubuntu/Clipper`
-- SSH host-key verification is enabled; the host is already recorded in `%USERPROFILE%\.ssh\known_hosts`.
+- SSH host-key verification is enabled. Use repository-local `.ssh\known_hosts`, falling back to `$HOME\.ssh\known_hosts` when absent or empty.
+
+The entire repository-local `.ssh` folder is gitignored. Populate the empty
+`clipper-ec2.pem` with your private key and `known_hosts` with a verified server
+entry. Empty placeholders do not count as configured credentials. Never commit
+these files; cloning does not transfer them. Copy them securely between machines
+and restrict private-key access to your user. Neither location depends on a
+hardcoded Windows username.
 
 From PowerShell, run commands from the local repository root:
 
 ```powershell
-$key = Join-Path $HOME '.ssh\clipper-ec2.pem'
+function Resolve-SshFile($name) {
+    $local = Join-Path (Get-Location).Path ".ssh\$name"
+    if ((Test-Path -LiteralPath $local -PathType Leaf) -and (Get-Item -LiteralPath $local).Length -gt 0) { return $local }
+    return Join-Path $HOME ".ssh\$name"
+}
+$key = Resolve-SshFile 'clipper-ec2.pem'
+$knownHosts = Resolve-SshFile 'known_hosts'
 $settings = @{}
 Get-Content .env | ForEach-Object {
-    if ($_ -match '^(PRODUCTION_HOST|PRODUCTION_PROFILES)=(.*)$') {
-        $settings[$matches[1]] = $matches[2].Trim()
+    if ($_ -match '^(PRODUCTION_HOST|PRODUCTION_PROFILES|PRODUCTION_SSH_KEY)=(.*)$') {
+        $settings[$matches[1]] = $matches[2].Trim().Trim('"').Trim("'")
     }
 }
+if ($settings.PRODUCTION_SSH_KEY) {
+    $key = $settings.PRODUCTION_SSH_KEY
+    if ($key -eq '~' -or $key.StartsWith('~/') -or $key.StartsWith('~\')) {
+        $key = Join-Path $HOME $key.Substring(1).TrimStart('\', '/')
+    } elseif (-not [System.IO.Path]::IsPathRooted($key)) {
+        $key = Join-Path (Get-Location).Path $key
+    }
+}
+$sshOptions = @('-i', $key, '-o', ('UserKnownHostsFile="{0}"' -f $knownHosts),
+    '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes')
 $productionHost = $settings.PRODUCTION_HOST
 if (-not $productionHost) { throw 'Set PRODUCTION_HOST in the ignored root .env.' }
-ssh -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "ubuntu@$productionHost"
+ssh @sshOptions "ubuntu@$productionHost"
 ```
 
-Do not copy, print, or commit the private key.
+Do not print or commit the private key. Transfer it only through a secure channel.
+`sync_seen_ids.py` uses the same local-first selection, including the optional
+`PRODUCTION_SSH_KEY` override. Run the setup block above before the commands below.
+
+For a new machine without an authorized key, generate one locally with
+`ssh-keygen -t ed25519 -f .ssh\clipper-ec2.pem` (remove only the empty key placeholder
+first, or confirm overwriting it). Install the contents of the resulting `.pub`
+file in the production `ubuntu` user's `~/.ssh/authorized_keys` using existing
+access or AWS EC2 Instance Connect. Keep existing authorized keys.
+Generating a key alone does not grant server access; AWS cannot re-download an
+existing private key.
+
+Before the first local connection, independently verify the server's ED25519
+fingerprint using `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` through a
+trusted server console. Then connect with:
+
+```powershell
+ssh -i $key -o ('UserKnownHostsFile="{0}"' -f (Join-Path (Get-Location).Path '.ssh\known_hosts')) -o StrictHostKeyChecking=ask "ubuntu@$productionHost"
+```
+
+Accept only a matching fingerprint. Rerun the setup block to select the newly
+populated local `known_hosts`; automated commands continue to require strict verification.
 
 ## Applications and services
 
@@ -74,16 +118,40 @@ $profiles = $settings.PRODUCTION_PROFILES -split ',' | ForEach-Object { $_.Trim(
 if (-not $profiles) { throw 'Set PRODUCTION_PROFILES in the ignored root .env.' }
 $services = $profiles | ForEach-Object { "clipper-$($_).service" }
 $serviceList = $services -join ' '
-ssh -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "ubuntu@$productionHost" "sudo -n systemctl restart $serviceList"
-ssh -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "ubuntu@$productionHost" "systemctl is-active $serviceList"
+ssh @sshOptions "ubuntu@$productionHost" "sudo -n systemctl restart $serviceList"
+ssh @sshOptions "ubuntu@$productionHost" "systemctl is-active $serviceList"
 ```
 
 For a change affecting only one profile, restart only its service. Check recent logs if a service does not return `active`:
 
 ```powershell
 $unitList = $services -join ' -u '
-ssh -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "ubuntu@$productionHost" "sudo -n journalctl -u $unitList -n 100 --no-pager"
+ssh @sshOptions "ubuntu@$productionHost" "sudo -n journalctl -u $unitList -n 100 --no-pager"
 ```
+
+### Pausing an account
+
+Set `ACCOUNT_ENABLED=false` in the **server-side** `accounts\<account>.env`, then
+restart only `clipper-<account>.service`. Leave `CREATORS`, credentials and all
+state paths unchanged. Each service owns that account's five-app pipeline; confirm
+its systemd `ExecStart` selects the intended account and its `KillMode` is
+`control-group` (the systemd default), so stopping/restarting it also stops its
+workers without touching other accounts' units.
+
+The launcher reads the switch before starting any app. A disabled service remains
+`active` with only its idle launcher, not five workers; check the journal for
+`ACCOUNT_ENABLED=false` and verify its cgroup has no workers. This avoids restart
+loops even with `Restart=always`. Disabled one-off launcher commands exit without
+work. Direct single-app/maintenance commands are not gated by this launcher switch.
+An exported `ACCOUNT_ENABLED` overrides the account file; check unit overrides if
+the file setting appears ineffective. Keep the account in `PRODUCTION_PROFILES`
+so shared deployments can still restart it safely.
+
+To resume, set `ACCOUNT_ENABLED=true` and restart the account service. Changes are
+not hot-reloaded. Pausing/resuming does not delete or rewrite queues, saved plans,
+tokens or seen IDs. Follow the checksum procedure above when stopping services.
+An empty `CREATORS` or an all-zero account is invalid; quota edits also do not
+cancel saved same-day assignments and are not an account pause mechanism.
 
 ## Deploying code changes
 
@@ -123,7 +191,7 @@ before restarting. A revoked previous token will not become usable just because 
 The remote application directory is not a Git checkout. Deploy only the changed, required application files from the repository root with `scp`, preserving their paths. For example:
 
 ```powershell
-scp -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes .\apps\ClipAI\src\clipai\service.py "ubuntu@${productionHost}:/home/ubuntu/Clipper/apps/ClipAI/src/clipai/service.py"
+scp @sshOptions .\apps\ClipAI\src\clipai\service.py "ubuntu@${productionHost}:/home/ubuntu/Clipper/apps/ClipAI/src/clipai/service.py"
 ```
 
 Repeat for each changed runtime file, then restart the affected service or both services if the change is shared. Confirm the service state and review logs when needed. Do not use a destructive sync or delete remote-only files.

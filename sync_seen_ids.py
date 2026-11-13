@@ -25,9 +25,21 @@ sys.path.insert(0, str(REPO_ROOT / "apps" / "Common" / "src"))
 from common.env import available_accounts, load_app_env  # noqa: E402
 
 CLIP_ID = re.compile(r"^\d{6,30}$")
-DEFAULT_KEY = Path.home() / ".ssh" / "clipper-ec2.pem"
 REMOTE_APP_DIR = "/home/ubuntu/Clipper"
 REMOTE_PYTHON = "/home/ubuntu/venv/bin/python"
+
+
+def ssh_file(name: str) -> Path:
+    local = REPO_ROOT / ".ssh" / name
+    return local if local.is_file() and local.stat().st_size > 0 else Path.home() / ".ssh" / name
+
+
+def production_ssh_key() -> Path:
+    override = os.getenv("PRODUCTION_SSH_KEY", "").strip()
+    if not override:
+        return ssh_file("clipper-ec2.pem")
+    path = Path(override).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 def discover_profiles() -> list[str]:
@@ -120,10 +132,12 @@ def production_host() -> str:
 def push(profile: str, *, dry_run: bool = False, timeout: float = 60) -> dict[str, int]:
     ids = read_seen_ids(resolve_state_file(profile))
     ids = {value for value in ids if CLIP_ID.match(value)}
-    key = Path(os.getenv("PRODUCTION_SSH_KEY", str(DEFAULT_KEY))).expanduser()
+    key = production_ssh_key()
+    known_hosts = ssh_file("known_hosts")
     remote = f"cd {REMOTE_APP_DIR} && {REMOTE_PYTHON} sync_seen_ids.py --{profile} --merge-stdin" + (" --dry-run" if dry_run else "")
     command = [
-        "ssh", "-i", str(key), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+        "ssh", "-i", str(key), "-o", f'UserKnownHostsFile="{known_hosts}"',
+        "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
         "-o", "ConnectTimeout=15", f"ubuntu@{production_host()}", remote,
     ]
     completed = subprocess.run(command, input=json.dumps(sorted(ids)), capture_output=True, text=True, timeout=timeout)

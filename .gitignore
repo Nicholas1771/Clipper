@@ -1,4 +1,5 @@
 .idea/
+.ssh/
 *.iml
 __pycache__/
 *.pyc

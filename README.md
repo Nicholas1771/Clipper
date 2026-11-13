@@ -63,6 +63,20 @@ YOUTUBE_SELECTION_MODE=instagram_top
 
 Each entry is `creator:Instagram posts per day:YouTube posts per day`. Zero disables that platform for that creator. Quotas belong only in the account file; do not set `POSTS_PER_DAY`, `INSTAGRAM_POSTS_PER_DAY`, or `YOUTUBE_POSTS_PER_DAY` separately. The latter two are derived internally from the creator list. A creator can be used by multiple accounts with different quotas.
 
+To pause an entire account, set `ACCOUNT_ENABLED=false` in `accounts\<account>.env`
+and restart its launcher/service. The default is `true` when omitted; an exported
+`ACCOUNT_ENABLED` takes precedence. This switch is account-scoped, not a root/app
+`.env` setting. The normal launcher stays idle with no child apps (so systemd does
+not repeatedly restart it); `--dry-run`, `--schedule`, `--now`, `--stop-after` and
+`--test` exit without work when disabled. No queues, schedules, seen history or
+tokens are changed. Set it back to `true` and restart to resume; existing schedule
+and queue recovery rules still apply. The switch gates `run_all_apps.py` and its
+shell wrappers, not directly invoked single-app or maintenance commands.
+Do not empty `CREATORS` or set every quota to zero to pause an account: active
+account configuration requires at least one positive quota. Removing a creator
+only works if another positive-quota creator remains, and saved same-day schedule
+assignments survive quota edits.
+
 Creator files define `STREAMER_NAME`, `STREAMER_HASHTAG`, `OVERLAY_IMAGE_PATH`, sourcing targets/filters, download authorization, and `REQUIRE_SOURCE_KICK_BRANDING`. N3on uses `false`; Navaeh uses `true`. Required branding is checked visually on downloaded source frames **before cache admission**: missing branding skips the candidate, and detector failures block admission rather than assuming approval. `false` allows unbranded sources; the editor can add branding as before. Keep API keys in shared root/app envs, not creator files. Place branding assets in `data\assets`.
 
 ```powershell

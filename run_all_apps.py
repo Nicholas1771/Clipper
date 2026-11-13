@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "apps" / "Common" / "src"))
-from common.env import available_accounts
+from common.env import available_accounts, parse_bool, read_dotenv
 
 APPS = ("scheduler", "sourcer", "ai", "editor", "publisher")
 APP_DIRS = {
@@ -24,6 +24,21 @@ APP_DIRS = {
 def discover_profiles() -> list[str]:
     """Every accounts/<name>.env is a runnable account."""
     return available_accounts(Path(__file__).resolve().parent)
+
+
+def is_account_enabled(repo_root: Path, profile: str) -> bool:
+    if profile not in available_accounts(repo_root):
+        raise FileNotFoundError(f"Account '{profile}' has no config file in {repo_root / 'accounts'}.")
+    values = read_dotenv(repo_root / "accounts" / f"{profile}.env")
+    return parse_bool(os.environ.get("ACCOUNT_ENABLED", values.get("ACCOUNT_ENABLED")), default=True)
+
+
+def wait_while_disabled() -> int:
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,7 +138,15 @@ def launch_processes(plan: list[tuple[str, Path, list[str]]], stop_mode: bool, t
 
 def main() -> int:
     args = parse_args()
-    plan = build_launch_plan(Path(__file__).resolve().parent, args)
+    repo_root = Path(__file__).resolve().parent
+    if not is_account_enabled(repo_root, args.profile):
+        print(f"[launcher] [{args.profile}] ACCOUNT_ENABLED=false; no apps will start. "
+              "Set ACCOUNT_ENABLED=true and restart to resume.", flush=True)
+        if args.dry_run or args.schedule or args.stop_after or args.test or args.now:
+            return 0
+        # Stay idle so systemd Restart=always does not create a restart loop.
+        return wait_while_disabled()
+    plan = build_launch_plan(repo_root, args)
     if args.dry_run:
         for name, dir_path, flags in plan:
             print(f"[dry-run] [{args.profile}] {name} @ {dir_path}: main.py {' '.join(flags)}".rstrip())
